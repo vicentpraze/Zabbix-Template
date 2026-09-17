@@ -1,0 +1,1212 @@
+zabbix_export:
+  version: '7.4'
+  template_groups:
+    - uuid: 11a13f6a854243a58f445cda17eff3d2
+      name: 'Templates/Network devices'
+  templates:
+    - uuid: a99c76384e0d440580b4f2f59113e1b4
+      template: 'Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC'
+      name: 'Synamedia vDCM Encoder by HTTP API (SPORTCAST IDC)'
+      vendor:
+        name: LiTV
+        version: 7.4.11
+      description: 'HTTP API monitoring template for Synamedia vDCM (Digital Content Manager) at SPORTCAST IDC (60.251.153.74). Monitors device health (alarm count, device state, vDCM state) via /load_alarm_footer and automatically discovers all S-type encoding services via LLD. Port 3 (T_O:1:2) output services: SprtGlf1, SprtGlf2, SprtTns, SprtUL. Required macros per host: {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}, {$VDCM.PROC.NODE}. Per-service stream stopped triggers (DISASTER) are the primary channel outage detection mechanism. Device-level vdcm_state trigger (DISASTER) covers full device failure. Set {$VIDEO.BITRATE.WARN}/{$VIDEO.BITRATE.MIN} per host to match expected bitrate range.'
+      groups:
+        - name: 'Templates/Network devices'
+      items:
+        - uuid: 74b4f039915d491d874769cc0caf4a86
+          name: 'vDCM active alarm count'
+          type: DEPENDENT
+          key: vdcm.device.alarms
+          history: 90d
+          description: 'Number of active alarms on the vDCM device (from /load_alarm_footer device_status field).'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.alarm_count
+          master_item:
+            key: vdcm.device.status
+        - uuid: 765e549d895b416690ea7a5e23db841a
+          name: vDCM device alarm details (non-background)
+          type: SCRIPT
+          key: vdcm.alarms.detail
+          delay: 2m
+          history: 90d
+          trends: '0'
+          value_type: TEXT
+          timeout: 30s
+          description: >-
+            Queries /status/alarms/get_rows and filters out permanent background noise.
+            Returns "OK" when only background noise present.
+            Returns alarm details (e.g. "Major | Equipment Fault | Board 1") for real faults.
+            NOTE: This device returns HTTP 204 on /status/alarms/get_rows (firmware limitation).
+            Fallback: parses tbldevicealarms table from the /status page instead.
+            Background noise on this device (SDI input): PTS Discontinuity, UDP/TS Stream Loss,
+            Input Signal Loss, No Input Signal (suppressed — from unused SDI port slots).
+          params: |
+var url = '{$VDCM.URL}'.replace(/\/+$/, '');  // strip trailing slash
+var user = '{$VDCM.USER}';
+var pass = '{$VDCM.PASS}';
+var nodeKey = '{$VDCM.PROC.NODE}';
+if (!url || url.indexOf('http') !== 0) {
+    throw new Error('Invalid {$VDCM.URL}: "' + url + '". Set https://hostname[:port] in host macros.');
+}
+// Step 1: Login to vDCM (returns HTTP 302 + Set-Cookie).
+var login = new HttpRequest();
+try { login.setopt(64, 0); login.setopt(81, 0); } catch(e) {}
+login.addHeader('Content-Type: application/x-www-form-urlencoded');
+login.post(
+    url + '/login_handler?came_from=%2F',
+    'login=' + encodeURIComponent(user) +
+    '&password=' + encodeURIComponent(pass) +
+    '&login_button=Login'
+);
+var hdrs = login.getHeaders(true);
+var cookies = [];
+Object.keys(hdrs).forEach(function(k) {
+    if (k.toLowerCase() === 'set-cookie') {
+        var v = hdrs[k];
+        if (Array.isArray(v)) {
+            v.forEach(function(c) { cookies.push(c.split(';')[0].trim()); });
+        } else {
+            cookies.push(v.split(';')[0].trim());
+        }
+    }
+});
+if (cookies.length === 0) {
+    throw new Error('vDCM login failed: no Set-Cookie. Check {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}.');
+}
+var api = new HttpRequest();
+try { api.setopt(64, 0); api.setopt(81, 0); } catch(e) {}
+api.addHeader('Content-Type: application/x-www-form-urlencoded');
+api.addHeader('Cookie: ' + cookies.join('; '));
+// Step 2: Trigger bitrates/processing refresh for this node
+api.get(url + '/bitrates/processing/refresh?s_xID=' + encodeURIComponent(nodeKey) + '&s_type=');
+// Step 3: Fetch processing bitrate table (profile-level rows)
+var getRowsResp = api.post(
+    url + '/bitrates/processing/get_rows?s_xID=' + encodeURIComponent(nodeKey) + '&s_type=',
+    'table_id=bitrates_processing_table&paging_info_bitrates_processing_table=' +
+        encodeURIComponent('{"start_row":0,"rows_to_show":500}')
+);
+if (!getRowsResp) {
+    throw new Error('vDCM /bitrates/processing/get_rows empty response. Check {$VDCM.PROC.NODE}: ' + nodeKey);
+}
+// Extract tbl_data from the XML/script response
+var tblMatch = getRowsResp.match(/tbl_data_bitrates_processing_table='([\s\S]*?)'/);
+if (!tblMatch) {
+    throw new Error('bitrates/processing: no table data. Response: ' + getRowsResp.substring(0, 200));
+}
+var raw = tblMatch[1]
+    .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+    .replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+var rows = JSON.parse(raw);
+// Step 4: Aggregate per-service bitrates from profile rows
+// Profile rows contain " @ " in name (e.g. "SprtGlf1 (1920x1080p29.97 @ 5000 kbps) (MR)")
+// Service rows do NOT contain " @ " (e.g. "SprtGlf1") and show S-node overhead only — skip them
+var svcMap = {};
+var procBps = 0;
+rows.forEach(function(row) {
+    var v = row.values || [];
+    var name = String(v[2] || '').trim();
+    var curMbps = parseFloat(String(v[4] || '0').trim()) || 0;
+    var bps = Math.round(curMbps * 1000000);
+    if (name.indexOf(' @ ') !== -1) {
+        // Profile-level row: service name is the part before the first ' ('
+        var svcName = name.split(' (')[0].trim();
+        if (!svcMap[svcName]) { svcMap[svcName] = { name: svcName, bps: 0, title: svcName }; }
+        svcMap[svcName].bps += bps;
+        procBps += bps;
+    }
+});
+var services = Object.keys(svcMap).map(function(k) { return svcMap[k]; });
+if (services.length === 0) {
+    throw new Error('No profile rows found in bitrates/processing. Check {$VDCM.PROC.NODE}: ' + nodeKey);
+}
+try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+return JSON.stringify({ proc_bps: procBps, services: services });
+var url = '{$VDCM.URL}'.replace(/\/+$/, '');
+var user = '{$VDCM.USER}';
+var pass = '{$VDCM.PASS}';
+var sdiNodes = '{$VDCM.SDI.NODES}'.split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+if (!url || url.indexOf('http') !== 0) {
+    throw new Error('Invalid {$VDCM.URL}: "' + url + '".');
+}
+var login = new HttpRequest();
+try { login.setopt(64, 0); login.setopt(81, 0); } catch(e) {}
+login.addHeader('Content-Type: application/x-www-form-urlencoded');
+login.post(
+    url + '/login_handler?came_from=%2F',
+    'login=' + encodeURIComponent(user) +
+    '&password=' + encodeURIComponent(pass) +
+    '&login_button=Login'
+);
+var hdrs = login.getHeaders(true);
+var cookies = [];
+Object.keys(hdrs).forEach(function(k) {
+    if (k.toLowerCase() === 'set-cookie') {
+        var v = hdrs[k];
+        if (Array.isArray(v)) {
+            v.forEach(function(c) { cookies.push(c.split(';')[0].trim()); });
+        } else {
+            cookies.push(v.split(';')[0].trim());
+        }
+    }
+});
+if (cookies.length === 0) {
+    throw new Error('vDCM login failed: no Set-Cookie. Check {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}.');
+}
+var api = new HttpRequest();
+try { api.setopt(64, 0); api.setopt(81, 0); } catch(e) {}
+api.addHeader('Content-Type: application/x-www-form-urlencoded');
+api.addHeader('Cookie: ' + cookies.join('; '));
+var result = [];
+sdiNodes.forEach(function(xid, idx) {
+    var resp = api.post(
+        url + '/service/overview/opennode2',
+        'xID=' + encodeURIComponent(xid) + '&type='
+    );
+    var signal = 0;
+    var svcName = '';
+    try {
+        var children = JSON.parse(resp);
+        if (children.length > 0) {
+            var ctx = children[0].context || '';
+            signal = (ctx.indexOf('_129d') !== -1) ? 1 : 0;
+            var title = children[0].title || '';
+            svcName = title.split(/[\s(]/)[0];
+        }
+    } catch(e) {}
+    result.push({ name: 'SDI' + (idx + 1), port: xid, service: svcName, signal: signal });
+});
+try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+return JSON.stringify(result);
+var url   = '{$VDCM.URL}'.replace(/\/+$/, '');
+var user  = '{$VDCM.USER}';
+var pass  = '{$VDCM.PASS}';
+var cards = '{$VDCM.INPUT.CARDS}'.split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+if (!url || url.indexOf('http') !== 0) throw new Error('Invalid {$VDCM.URL}: "' + url + '"');
+var login = new HttpRequest();
+try { login.setopt(64, 0); } catch(e) {}
+try { login.setopt(81, 0); } catch(e) {}
+try { login.setopt(52, 0); } catch(e) {}
+login.addHeader('Content-Type: application/x-www-form-urlencoded');
+login.post(url + '/login_handler?came_from=%2F',
+    'login=' + encodeURIComponent(user) + '&password=' + encodeURIComponent(pass) + '&login_button=Login');
+var loginCode = login.getStatus();
+var cookies = [];
+try {
+    var hdrs = login.getHeaders(false);
+    if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+        Object.keys(hdrs).forEach(function(k) {
+            if (k.toLowerCase() === 'set-cookie') {
+                var v = hdrs[k];
+                (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                    var p = c.split(';')[0].trim(); if (p) cookies.push(p);
+                });
+            }
+        });
+    }
+} catch(e) {}
+if (cookies.length === 0) {
+    try {
+        var rawHdr = login.getHeaders(true);
+        if (typeof rawHdr !== 'string') rawHdr = String(rawHdr);
+        (rawHdr.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+            var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+            if (p) cookies.push(p);
+        });
+    } catch(e) {}
+}
+if (cookies.length === 0) throw new Error('Login failed (HTTP ' + loginCode + '). Check {$VDCM.URL}/{$VDCM.USER}/{$VDCM.PASS}.');
+var cookieHdr = cookies.join('; ');
+var allAlarms = [];
+cards.forEach(function(card) {
+    var api = new HttpRequest();
+    try { api.setopt(64, 0); } catch(e) {}
+    try { api.setopt(81, 0); } catch(e) {}
+    api.addHeader('Content-Type: application/x-www-form-urlencoded');
+    api.addHeader('Cookie: ' + cookieHdr);
+    var resp = api.post(
+        url + '/status/processing/get_rows?s_xID=' + encodeURIComponent(card),
+        'table_id=processing_table&paging_info_processing_table=' +
+        encodeURIComponent('{"start_row":0,"rows_to_show":500}'));
+    if (!resp || resp.indexOf('No Processing Alarms') >= 0) return;
+    var marker = "tbl_data_processing_table='";
+    var idx = resp.indexOf(marker);
+    if (idx < 0) return;
+    var start = idx + marker.length;
+    var end = resp.indexOf("';", start);
+    if (end < 0) return;
+    var raw = resp.substring(start, end)
+        .replace(/&quot;/g,'"').replace(/&amp;/g,'&')
+        .replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>');
+    var rows; try { rows = JSON.parse(raw); } catch(e) { return; }
+    function stripHtml(s) { return String(s||'').replace(/<[^>]+>/g,'').trim(); }
+    rows.forEach(function(row) {
+        var v = row.values || [];
+        var svc = stripHtml(v[3]);
+        var alarmType = stripHtml(v[4]);
+        if (/\(\d+x\d+/.test(svc)) return;
+        if (!svc || /^fi-/.test(svc) || /^\d+$/.test(svc)) return;
+        if (svc) allAlarms.push(alarmType ? svc+': '+alarmType : svc);
+    });
+});
+if (allAlarms.length === 0) return 'OK';
+var seen = {};
+try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+return allAlarms.filter(function(a){ if(seen[a])return false;seen[a]=true;return true; }).join(', ');
+var url = '{$VDCM.URL}'.replace(/\/+$/, '');  // strip trailing slash
+var user = '{$VDCM.USER}';
+var pass = '{$VDCM.PASS}';
+if (!url || url.indexOf('http') !== 0) {
+    throw new Error('Invalid {$VDCM.URL}: "' + url + '". Set https://hostname[:port] in host macros.');
+}
+var login = new HttpRequest();
+try { login.setopt(64, 0); login.setopt(81, 0); } catch(e) {}
+login.addHeader('Content-Type: application/x-www-form-urlencoded');
+login.post(
+    url + '/login_handler?came_from=%2F',
+    'login=' + encodeURIComponent(user) +
+    '&password=' + encodeURIComponent(pass) +
+    '&login_button=Login'
+);
+var hdrs = login.getHeaders(true);
+var cookies = [];
+Object.keys(hdrs).forEach(function(k) {
+    if (k.toLowerCase() === 'set-cookie') {
+        var v = hdrs[k];
+        if (Array.isArray(v)) {
+            v.forEach(function(c) { cookies.push(c.split(';')[0].trim()); });
+        } else {
+            cookies.push(v.split(';')[0].trim());
+        }
+    }
+});
+if (cookies.length === 0) {
+    throw new Error('vDCM login failed: no Set-Cookie. Check {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}.');
+}
+var api = new HttpRequest();
+try { api.setopt(64, 0); api.setopt(81, 0); } catch(e) {}
+api.addHeader('Cookie: ' + cookies.join('; '));
+var response = api.get(url + '/load_alarm_footer');
+if (!response) {
+    throw new Error('vDCM /load_alarm_footer returned empty response.');
+}
+var alarmMatch = response.match(/device_status'\)\.textContent = '([^']*)'/);
+var stateMatch = response.match(/device_state'\)\.textContent = '([^']*)'/);
+var vdcmMatch  = response.match(/vdcm_state'\)\.textContent = '([^']*)'/);
+var alarmCount  = alarmMatch ? parseInt(alarmMatch[1], 10) : -1;
+var deviceState = stateMatch ? stateMatch[1] : 'unknown';
+var vdcmState   = vdcmMatch  ? vdcmMatch[1]  : 'unknown';
+try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+return JSON.stringify({
+    alarm_count: alarmCount,
+    device_state: deviceState,
+    vdcm_state: vdcmState
+});
+var url  = '{$VDCM.URL}'.replace(/\/+$/, '');
+var user = '{$VDCM.USER}';
+var pass = '{$VDCM.PASS}';
+if (!url || url.indexOf('http') !== 0) throw new Error('Invalid {$VDCM.URL}: "' + url + '"');
+var login = new HttpRequest();
+try { login.setopt(64, 0); } catch(e) {}
+try { login.setopt(81, 0); } catch(e) {}
+try { login.setopt(52, 0); } catch(e) {}
+login.addHeader('Content-Type: application/x-www-form-urlencoded');
+login.post(url + '/login_handler?came_from=%2F',
+    'login=' + encodeURIComponent(user) + '&password=' + encodeURIComponent(pass) + '&login_button=Login');
+var loginCode = login.getStatus();
+var cookies = [];
+try {
+    var hdrs = login.getHeaders(false);
+    if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+        Object.keys(hdrs).forEach(function(k) {
+            if (k.toLowerCase() === 'set-cookie') {
+                var v = hdrs[k];
+                (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                    var p = c.split(';')[0].trim(); if (p) cookies.push(p);
+                });
+            }
+        });
+    }
+} catch(e) {}
+if (cookies.length === 0) {
+    try {
+        var rawHdr = login.getHeaders(true);
+        if (typeof rawHdr !== 'string') rawHdr = String(rawHdr);
+        (rawHdr.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+            var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+            if (p) cookies.push(p);
+        });
+    } catch(e) {}
+}
+if (cookies.length === 0) throw new Error('Login failed (HTTP ' + loginCode + '). Check {$VDCM.URL}/{$VDCM.USER}/{$VDCM.PASS}.');
+var api = new HttpRequest();
+try { api.setopt(64, 0); } catch(e) {}
+try { api.setopt(81, 0); } catch(e) {}
+api.addHeader('Content-Type: application/x-www-form-urlencoded');
+api.addHeader('Cookie: ' + cookies.join('; '));
+var resp = api.post(url + '/status/alarms/get_rows',
+    'table_id=status_alarm_table&paging_info_status_alarm_table=' +
+    encodeURIComponent('{"start_row":0,"rows_to_show":500}'));
+var alarmCode = api.getStatus();
+var NOISE = ['PTS Discontinuity','UDP Stream Loss','TS Stream Loss','Input Signal Loss','No Input Signal'];
+function stripHtml(s) { return String(s||'').replace(/<[^>]+>/g,'').trim(); }
+var rows = null;
+if (resp && alarmCode !== 204) {
+    var marker = "tbl_data_status_alarm_table='";
+    var idx = resp.indexOf(marker);
+    if (idx >= 0) {
+        var start = idx + marker.length;
+        var end = resp.indexOf("';", start);
+        if (end >= 0) {
+            var raw = resp.substring(start, end)
+                .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+                .replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+            try { rows = JSON.parse(raw); } catch(e) {}
+        }
+    }
+}
+if (rows === null) {
+    // Fallback: /status/alarms/get_rows returns HTTP 204 on this firmware.
+    // Step 1: Get summary from /status/summary to count active alarms.
+    // Step 2: If alarms detected, fetch /status/device for actual descriptions
+    //         (Node Status Overview columns: App | Port | Measurement | Info | Detail).
+    var fbApi = new HttpRequest();
+    try { fbApi.setopt(64, 0); } catch(e) {}
+    try { fbApi.setopt(81, 0); } catch(e) {}
+    fbApi.addHeader('Cookie: ' + cookies.join('; '));
+    var sumPage = fbApi.get(url + '/status');
+    rows = [];
+    function fbDec(r) {
+        try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+        return r.replace(/&quot;/g,'"').replace(/&amp;/g,'&')
+            .replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>');
+    }
+    function fbTbl(pg, nm) {
+        var mk = nm+"='", ii=(pg||'').indexOf(mk);
+        if(ii<0) return [];
+        var jj=pg.indexOf("';",ii+mk.length); if(jj<0) return [];
+        try{return JSON.parse(fbDec(pg.substring(ii+mk.length,jj)));}catch(e2){return [];}
+    }
+    var totAlarms=0;
+    ['tbl_data_tbldevicealarms','tbl_data_tblioalarms'].forEach(function(t2){
+        fbTbl(sumPage,t2).forEach(function(r2){
+            (r2.values||[]).forEach(function(c2){
+                var s2=String(c2||'');
+                if(s2.charAt(0)==='{'){try{var o2=JSON.parse(s2);if(o2.class==='LinkControl')totAlarms+=parseInt(o2.content,10)||0;}catch(e3){}}
+            });
+        });
+    });
+    if(totAlarms>0){
+        var detApi=new HttpRequest();
+        try{detApi.setopt(64,0);}catch(e){}
+        try{detApi.setopt(81,0);}catch(e){}
+        detApi.addHeader('Cookie: '+cookies.join('; '));
+        var detPage=detApi.get(url+'/status/device');
+        var detRows=fbTbl(detPage,'tbl_data_device_detail_table');
+        rows=detRows.length>0?detRows:fbTbl(sumPage,'tbl_data_tbldevicealarms');
+    }else{
+        rows=fbTbl(sumPage,'tbl_data_tbldevicealarms');
+    }
+}
+var seen = {}; var parts = [];
+rows.forEach(function(row) {
+    var v = row.values || [];
+    var hasLinkCtrl = false, totalCount = 0, texts = [];
+    v.forEach(function(cell) {
+        // Support cell as Object (parsed JSON) OR as JSON string
+        var lc = (cell && typeof cell === 'object') ? cell : null;
+        if (!lc) {
+            var s = String(cell || '');
+            if (s.charAt(0) === '{') { try { lc = JSON.parse(s); } catch(e) {} }
+        }
+        if (lc && lc['class'] === 'LinkControl') {
+            hasLinkCtrl = true;
+            var n = parseInt(lc.content, 10);
+            if (!isNaN(n)) totalCount += n;
+            return;
+        }
+        var t = stripHtml(String(cell || ''));
+        if (t.length > 1 && !/^\d+$/.test(t)) texts.push(t);
+    });
+    var isNoise = NOISE.some(function(n){ return texts.some(function(t){ return t.indexOf(n)>=0; }); });
+    if (isNoise) return;
+    if (hasLinkCtrl) {
+        // Skip summary-level LinkControl rows (not actionable for encoder monitoring)
+    } else if (texts.length > 0) {
+        var entry = texts.join(' | ');
+        if (!seen[entry]) { seen[entry]=true; parts.push(entry); }
+    }
+});
+try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+return parts.length > 0 ? parts.join(', ') : 'OK';
+            var url  = '{$VDCM.URL}'.replace(/\/+$/, '');
+            var user = '{$VDCM.USER}';
+            var pass = '{$VDCM.PASS}';
+            if (!url || url.indexOf('http') !== 0) throw new Error('Invalid {$VDCM.URL}: "' + url + '"');
+            var login = new HttpRequest();
+            try { login.setopt(64, 0); } catch(e) {}
+            try { login.setopt(81, 0); } catch(e) {}
+            try { login.setopt(52, 0); } catch(e) {}
+            login.addHeader('Content-Type: application/x-www-form-urlencoded');
+            login.post(url + '/login_handler?came_from=%2F',
+                'login=' + encodeURIComponent(user) + '&password=' + encodeURIComponent(pass) + '&login_button=Login');
+            var loginCode = login.getStatus();
+            var cookies = [];
+            try {
+                var hdrs = login.getHeaders(false);
+                if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+                    Object.keys(hdrs).forEach(function(k) {
+                        if (k.toLowerCase() === 'set-cookie') {
+                            var v = hdrs[k];
+                            (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                                var p = c.split(';')[0].trim(); if (p) cookies.push(p);
+                            });
+                        }
+                    });
+                }
+            } catch(e) {}
+            if (cookies.length === 0) {
+                try {
+                    var rawHdr = login.getHeaders(true);
+                    if (typeof rawHdr !== 'string') rawHdr = String(rawHdr);
+                    (rawHdr.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+                        var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+                        if (p) cookies.push(p);
+                    });
+                } catch(e) {}
+            }
+            if (cookies.length === 0) throw new Error('Login failed (HTTP ' + loginCode + '). Check {$VDCM.URL}/{$VDCM.USER}/{$VDCM.PASS}.');
+            var api = new HttpRequest();
+            try { api.setopt(64, 0); } catch(e) {}
+            try { api.setopt(81, 0); } catch(e) {}
+            api.addHeader('Content-Type: application/x-www-form-urlencoded');
+            api.addHeader('Cookie: ' + cookies.join('; '));
+            var resp = api.post(url + '/status/alarms/get_rows',
+                'table_id=status_alarm_table&paging_info_status_alarm_table=' +
+                encodeURIComponent('{"start_row":0,"rows_to_show":500}'));
+            var alarmCode = api.getStatus();
+            var NOISE = ['PTS Discontinuity','UDP Stream Loss','TS Stream Loss','Input Signal Loss','No Input Signal'];
+            function stripHtml(s) { return String(s||'').replace(/<[^>]+>/g,'').trim(); }
+            var rows = null;
+            if (resp && alarmCode !== 204) {
+                var marker = "tbl_data_status_alarm_table='";
+                var idx = resp.indexOf(marker);
+                if (idx >= 0) {
+                    var start = idx + marker.length;
+                    var end = resp.indexOf("';", start);
+                    if (end >= 0) {
+                        var raw = resp.substring(start, end)
+                            .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+                            .replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+                        try { rows = JSON.parse(raw); } catch(e) {}
+                    }
+                }
+            }
+            if (rows === null) {
+                // Fallback: /status/alarms/get_rows returns HTTP 204 on this firmware.
+                // Step 1: Get summary from /status/summary to count active alarms.
+                // Step 2: If alarms detected, fetch /status/device for actual descriptions
+                //         (Node Status Overview columns: App | Port | Measurement | Info | Detail).
+                var fbApi = new HttpRequest();
+                try { fbApi.setopt(64, 0); } catch(e) {}
+                try { fbApi.setopt(81, 0); } catch(e) {}
+                fbApi.addHeader('Cookie: ' + cookies.join('; '));
+                var sumPage = fbApi.get(url + '/status');
+                rows = [];
+                function fbDec(r) {
+                    return r.replace(/&quot;/g,'"').replace(/&amp;/g,'&')
+                        .replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>');
+                }
+                function fbTbl(pg, nm) {
+                    var mk = nm+"='", ii=(pg||'').indexOf(mk);
+                    if(ii<0) return [];
+                    var jj=pg.indexOf("';",ii+mk.length); if(jj<0) return [];
+                    try{return JSON.parse(fbDec(pg.substring(ii+mk.length,jj)));}catch(e2){return [];}
+                }
+                var totAlarms=0;
+                ['tbl_data_tbldevicealarms','tbl_data_tblioalarms'].forEach(function(t2){
+                    fbTbl(sumPage,t2).forEach(function(r2){
+                        (r2.values||[]).forEach(function(c2){
+                            var s2=String(c2||'');
+                            if(s2.charAt(0)==='{'){try{var o2=JSON.parse(s2);if(o2.class==='LinkControl')totAlarms+=parseInt(o2.content,10)||0;}catch(e3){}}
+                        });
+                    });
+                });
+                if(totAlarms>0){
+                    var detApi=new HttpRequest();
+                    try{detApi.setopt(64,0);}catch(e){}
+                    try{detApi.setopt(81,0);}catch(e){}
+                    detApi.addHeader('Cookie: '+cookies.join('; '));
+                    var detPage=detApi.get(url+'/status/device');
+                    var detRows=fbTbl(detPage,'tbl_data_device_detail_table');
+                    rows=detRows.length>0?detRows:fbTbl(sumPage,'tbl_data_tbldevicealarms');
+                }else{
+                    rows=fbTbl(sumPage,'tbl_data_tbldevicealarms');
+                }
+            }
+            var seen = {}; var parts = [];
+            rows.forEach(function(row) {
+                var v = row.values || [];
+                var hasLinkCtrl = false, totalCount = 0, texts = [];
+                v.forEach(function(cell) {
+                    var lc = (cell && typeof cell === 'object') ? cell : null;
+                    if (!lc) {
+                        var s = String(cell || '');
+                        if (s.charAt(0) === '{') { try { lc = JSON.parse(s); } catch(e) {} }
+                    }
+                    if (lc && lc['class'] === 'LinkControl') {
+                        hasLinkCtrl = true;
+                        var n = parseInt(lc.content, 10);
+                        if (!isNaN(n)) totalCount += n;
+                        return;
+                    }
+                    var t = stripHtml(String(cell || ''));
+                    if (t.length > 1 && !/^\d+$/.test(t)) texts.push(t);
+                });
+                var isNoise = NOISE.some(function(n){ return texts.some(function(t){ return t.indexOf(n)>=0; }); });
+                if (isNoise) return;
+                if (hasLinkCtrl) {
+                    // Skip summary-level LinkControl rows (not actionable for encoder monitoring)
+                } else if (texts.length > 0) {
+                    var entry = texts.join(' | ');
+                    if (!seen[entry]) { seen[entry]=true; parts.push(entry); }
+                }
+            });
+            return parts.length > 0 ? parts.join(', ') : 'OK';
+          triggers:
+            - uuid: 2fd0b99af8ae41c988bce844d01b7f68
+              expression: 'last(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.alarms.detail)<>"OK"'
+              name: 'vDCM: unexpected alarm — {ITEM.LASTVALUE}'
+              priority: HIGH
+              description: >-
+                Non-background alarm detected on the SPORTCAST vDCM (60.251.153.74).
+                Details: {ITEM.LASTVALUE}
+                Background noise (always present, excluded): PTS Discontinuity, UDP/TS Stream Loss, Input Signal Loss.
+                Check at {$VDCM.URL} → Status > Summary.
+              tags:
+                - tag: component
+                  value: encoder
+                - tag: scope
+                  value: availability
+        - uuid: 61ea70daa2b142cfaeff1c9018e88741
+          name: vDCM processing alarms (HTTP API)
+          type: SCRIPT
+          key: vdcm.processing.alarms
+          delay: 1m
+          history: 90d
+          trends: '0'
+          value_type: TEXT
+          timeout: 30s
+          description: >-
+            Queries /status/processing/get_rows for each SDI input card in {$VDCM.INPUT.CARDS}.
+            For SPORTCAST IDC: T_I:2:0=SprtUL, T_I:2:1=SprtTns, T_I:2:2=SprtGlf1, T_I:2:3=SprtGlf2.
+            Returns "OK" when no processing alarms.
+            Returns channel name + alarm type, e.g. "SprtUL: TS Sync Loss" when faults exist.
+          params: |
+            var url   = '{$VDCM.URL}'.replace(/\/+$/, '');
+            var user  = '{$VDCM.USER}';
+            var pass  = '{$VDCM.PASS}';
+            var cards = '{$VDCM.INPUT.CARDS}'.split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+            if (!url || url.indexOf('http') !== 0) throw new Error('Invalid {$VDCM.URL}: "' + url + '"');
+            var login = new HttpRequest();
+            try { login.setopt(64, 0); } catch(e) {}
+            try { login.setopt(81, 0); } catch(e) {}
+            try { login.setopt(52, 0); } catch(e) {}
+            login.addHeader('Content-Type: application/x-www-form-urlencoded');
+            login.post(url + '/login_handler?came_from=%2F',
+                'login=' + encodeURIComponent(user) + '&password=' + encodeURIComponent(pass) + '&login_button=Login');
+            var loginCode = login.getStatus();
+            var cookies = [];
+            try {
+                var hdrs = login.getHeaders(false);
+                if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+                    Object.keys(hdrs).forEach(function(k) {
+                        if (k.toLowerCase() === 'set-cookie') {
+                            var v = hdrs[k];
+                            (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                                var p = c.split(';')[0].trim(); if (p) cookies.push(p);
+                            });
+                        }
+                    });
+                }
+            } catch(e) {}
+            if (cookies.length === 0) {
+                try {
+                    var rawHdr = login.getHeaders(true);
+                    if (typeof rawHdr !== 'string') rawHdr = String(rawHdr);
+                    (rawHdr.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+                        var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+                        if (p) cookies.push(p);
+                    });
+                } catch(e) {}
+            }
+            if (cookies.length === 0) throw new Error('Login failed (HTTP ' + loginCode + '). Check {$VDCM.URL}/{$VDCM.USER}/{$VDCM.PASS}.');
+            var cookieHdr = cookies.join('; ');
+            var allAlarms = [];
+            cards.forEach(function(card) {
+                var api = new HttpRequest();
+                try { api.setopt(64, 0); } catch(e) {}
+                try { api.setopt(81, 0); } catch(e) {}
+                api.addHeader('Content-Type: application/x-www-form-urlencoded');
+                api.addHeader('Cookie: ' + cookieHdr);
+                var resp = api.post(
+                    url + '/status/processing/get_rows?s_xID=' + encodeURIComponent(card),
+                    'table_id=processing_table&paging_info_processing_table=' +
+                    encodeURIComponent('{"start_row":0,"rows_to_show":500}'));
+                if (!resp || resp.indexOf('No Processing Alarms') >= 0) return;
+                var marker = "tbl_data_processing_table='";
+                var idx = resp.indexOf(marker);
+                if (idx < 0) return;
+                var start = idx + marker.length;
+                var end = resp.indexOf("';", start);
+                if (end < 0) return;
+                var raw = resp.substring(start, end)
+                    .replace(/&quot;/g,'"').replace(/&amp;/g,'&')
+                    .replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>');
+                var rows; try { rows = JSON.parse(raw); } catch(e) { return; }
+                function stripHtml(s) { return String(s||'').replace(/<[^>]+>/g,'').trim(); }
+                rows.forEach(function(row) {
+                    var v = row.values || [];
+                    var svc = stripHtml(v[3]);
+                    var alarmType = stripHtml(v[4]);
+                    if (/\(\d+x\d+/.test(svc)) return;
+                    if (!svc || /^fi-/.test(svc) || /^\d+$/.test(svc)) return;
+                    if (svc) allAlarms.push(alarmType ? svc+': '+alarmType : svc);
+                });
+            });
+            if (allAlarms.length === 0) return 'OK';
+            var seen = {};
+            return allAlarms.filter(function(a){ if(seen[a])return false;seen[a]=true;return true; }).join(', ');
+          triggers:
+            - uuid: f4f9412e0fed4149a917f81f0ba2436c
+              expression: 'last(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.processing.alarms)<>"OK"'
+              name: 'vDCM: processing fault — {ITEM.LASTVALUE}'
+              priority: HIGH
+              description: >-
+                Processing-layer fault on SPORTCAST vDCM (60.251.153.74).
+                Affected channels: {ITEM.LASTVALUE}
+                Source: /status/processing/get_rows for SDI input cards ({$VDCM.INPUT.CARDS}).
+                Services: SprtUL / SprtTns / SprtGlf1 / SprtGlf2 (SDI1-SDI4).
+                Investigate at {$VDCM.URL} → Status > Processing.
+              tags:
+                - tag: component
+                  value: encoder
+                - tag: scope
+                  value: availability
+        - uuid: 75d5c74e70a04ffab1bea670b3ec4df4
+          name: 'vDCM device state'
+          type: DEPENDENT
+          key: vdcm.device.state
+          history: 30d
+          value_type: TEXT
+          description: 'vDCM device operational role string (e.g. "Active - Role: Standalone"). Informational only; no trigger.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.device_state
+          master_item:
+            key: vdcm.device.status
+        - uuid: 5572c802653a4d278f3983c9aabf0926
+          name: 'vDCM device health status'
+          type: SCRIPT
+          key: vdcm.device.status
+          delay: 2m
+          history: 1h
+          value_type: TEXT
+          params: |
+            var url = '{$VDCM.URL}'.replace(/\/+$/, '');  // strip trailing slash
+            var user = '{$VDCM.USER}';
+            var pass = '{$VDCM.PASS}';
+            if (!url || url.indexOf('http') !== 0) {
+                throw new Error('Invalid {$VDCM.URL}: "' + url + '". Set https://hostname[:port] in host macros.');
+            }
+            var login = new HttpRequest();
+            try { login.setopt(64, 0); login.setopt(81, 0); } catch(e) {}
+            login.addHeader('Content-Type: application/x-www-form-urlencoded');
+            login.post(
+                url + '/login_handler?came_from=%2F',
+                'login=' + encodeURIComponent(user) +
+                '&password=' + encodeURIComponent(pass) +
+                '&login_button=Login'
+            );
+            var hdrs = login.getHeaders(true);
+            var cookies = [];
+            Object.keys(hdrs).forEach(function(k) {
+                if (k.toLowerCase() === 'set-cookie') {
+                    var v = hdrs[k];
+                    if (Array.isArray(v)) {
+                        v.forEach(function(c) { cookies.push(c.split(';')[0].trim()); });
+                    } else {
+                        cookies.push(v.split(';')[0].trim());
+                    }
+                }
+            });
+            if (cookies.length === 0) {
+                throw new Error('vDCM login failed: no Set-Cookie. Check {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}.');
+            }
+            var api = new HttpRequest();
+            try { api.setopt(64, 0); api.setopt(81, 0); } catch(e) {}
+            api.addHeader('Cookie: ' + cookies.join('; '));
+            var response = api.get(url + '/load_alarm_footer');
+            if (!response) {
+                throw new Error('vDCM /load_alarm_footer returned empty response.');
+            }
+            var alarmMatch = response.match(/device_status'\)\.textContent = '([^']*)'/);
+            var stateMatch = response.match(/device_state'\)\.textContent = '([^']*)'/);
+            var vdcmMatch  = response.match(/vdcm_state'\)\.textContent = '([^']*)'/);
+            var alarmCount  = alarmMatch ? parseInt(alarmMatch[1], 10) : -1;
+            var deviceState = stateMatch ? stateMatch[1] : 'unknown';
+            var vdcmState   = vdcmMatch  ? vdcmMatch[1]  : 'unknown';
+            return JSON.stringify({
+                alarm_count: alarmCount,
+                device_state: deviceState,
+                vdcm_state: vdcmState
+            });
+          description: 'Logs into vDCM and queries /load_alarm_footer for device health. Returns JSON: {"alarm_count":0,"device_state":"Active - Role: Standalone", "vdcm_state":"Active"}. alarm_count is the number of active alarms; device_state shows operational role; vdcm_state is "Active" when normal.'
+          timeout: 30s
+          triggers:
+            - uuid: 71936c1f31cb476cb46131a8f5700b05
+              expression: 'nodata(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.device.status,6m)=1'
+              name: 'vDCM: unreachable (no data for 6 minutes)'
+              priority: HIGH
+              description: 'vDCM health check has not collected data for 6+ minutes (3 consecutive poll failures). Device may be offline, network unreachable, or login credentials invalid. Check {$VDCM.URL}.'
+              tags:
+                - tag: component
+                  value: encoder
+                - tag: scope
+                  value: availability
+        - uuid: 0c0e389d84d34ac58626782ffc2a2e88
+          name: 'vDCM state'
+          type: DEPENDENT
+          key: vdcm.device.vdcm_state
+          history: 30d
+          value_type: TEXT
+          description: 'vDCM operational state string (e.g. "Active"). Sourced from /load_alarm_footer vdcm_state element.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.vdcm_state
+          master_item:
+            key: vdcm.device.status
+          triggers:
+            - uuid: 5fc3296b740d48dc8651eec2899c0583
+              expression: 'last(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.device.vdcm_state)<>"Active"'
+              name: 'vDCM: state is not Active'
+              priority: DISASTER
+              description: 'The vDCM state is not "Active" (current: {ITEM.LASTVALUE}). Device may be in fault, standby, or restarting.'
+              tags:
+                - tag: component
+                  value: encoder
+                - tag: scope
+                  value: availability
+        - uuid: e760b4a7649b47ada2e67acfc75f24b6
+          name: 'vDCM all service bitrates (HTTP API)'
+          type: SCRIPT
+          key: vdcm.services.bitrates
+          delay: 2m
+          history: 1h
+          value_type: TEXT
+          params: |
+            var url = '{$VDCM.URL}'.replace(/\/+$/, '');  // strip trailing slash
+            var user = '{$VDCM.USER}';
+            var pass = '{$VDCM.PASS}';
+            var nodeKey = '{$VDCM.PROC.NODE}';
+            if (!url || url.indexOf('http') !== 0) {
+                throw new Error('Invalid {$VDCM.URL}: "' + url + '". Set https://hostname[:port] in host macros.');
+            }
+            // Step 1: Login to vDCM (returns HTTP 302 + Set-Cookie).
+            var login = new HttpRequest();
+            try { login.setopt(64, 0); login.setopt(81, 0); } catch(e) {}
+            login.addHeader('Content-Type: application/x-www-form-urlencoded');
+            login.post(
+                url + '/login_handler?came_from=%2F',
+                'login=' + encodeURIComponent(user) +
+                '&password=' + encodeURIComponent(pass) +
+                '&login_button=Login'
+            );
+            var hdrs = login.getHeaders(true);
+            var cookies = [];
+            Object.keys(hdrs).forEach(function(k) {
+                if (k.toLowerCase() === 'set-cookie') {
+                    var v = hdrs[k];
+                    if (Array.isArray(v)) {
+                        v.forEach(function(c) { cookies.push(c.split(';')[0].trim()); });
+                    } else {
+                        cookies.push(v.split(';')[0].trim());
+                    }
+                }
+            });
+            if (cookies.length === 0) {
+                throw new Error('vDCM login failed: no Set-Cookie. Check {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}.');
+            }
+            var api = new HttpRequest();
+            try { api.setopt(64, 0); api.setopt(81, 0); } catch(e) {}
+            api.addHeader('Content-Type: application/x-www-form-urlencoded');
+            api.addHeader('Cookie: ' + cookies.join('; '));
+            // Step 2: Trigger bitrates/processing refresh for this node
+            api.get(url + '/bitrates/processing/refresh?s_xID=' + encodeURIComponent(nodeKey) + '&s_type=');
+            // Step 3: Fetch processing bitrate table (profile-level rows)
+            var getRowsResp = api.post(
+                url + '/bitrates/processing/get_rows?s_xID=' + encodeURIComponent(nodeKey) + '&s_type=',
+                'table_id=bitrates_processing_table&paging_info_bitrates_processing_table=' +
+                    encodeURIComponent('{"start_row":0,"rows_to_show":500}')
+            );
+            if (!getRowsResp) {
+                throw new Error('vDCM /bitrates/processing/get_rows empty response. Check {$VDCM.PROC.NODE}: ' + nodeKey);
+            }
+            // Extract tbl_data from the XML/script response
+            var tblMatch = getRowsResp.match(/tbl_data_bitrates_processing_table='([\s\S]*?)'/);
+            if (!tblMatch) {
+                throw new Error('bitrates/processing: no table data. Response: ' + getRowsResp.substring(0, 200));
+            }
+            var raw = tblMatch[1]
+                .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+                .replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+            var rows = JSON.parse(raw);
+            // Step 4: Aggregate per-service bitrates from profile rows
+            // Profile rows contain " @ " in name (e.g. "SprtGlf1 (1920x1080p29.97 @ 5000 kbps) (MR)")
+            // Service rows do NOT contain " @ " (e.g. "SprtGlf1") and show S-node overhead only — skip them
+            var svcMap = {};
+            var procBps = 0;
+            rows.forEach(function(row) {
+                var v = row.values || [];
+                var name = String(v[2] || '').trim();
+                var curMbps = parseFloat(String(v[4] || '0').trim()) || 0;
+                var bps = Math.round(curMbps * 1000000);
+                if (name.indexOf(' @ ') !== -1) {
+                    // Profile-level row: service name is the part before the first ' ('
+                    var svcName = name.split(' (')[0].trim();
+                    if (!svcMap[svcName]) { svcMap[svcName] = { name: svcName, bps: 0, title: svcName }; }
+                    svcMap[svcName].bps += bps;
+                    procBps += bps;
+                }
+            });
+            var services = Object.keys(svcMap).map(function(k) { return svcMap[k]; });
+            if (services.length === 0) {
+                throw new Error('No profile rows found in bitrates/processing. Check {$VDCM.PROC.NODE}: ' + nodeKey);
+            }
+            return JSON.stringify({ proc_bps: procBps, services: services });
+          description: 'Logs into vDCM and queries /bitrates/processing for real per-service ABR encoded bitrates. Returns JSON: {"proc_bps":36800000,"services":[{"name":"SprtGlf1","bps":9000000},...]}.  proc_bps = sum of all profile bitrates. Per-service bps = sum of all ABR profiles for that service (e.g. SprtGlf1 @ 5000+2500+800+400 kbps = ~9 Mbps). Profile rows identified by " @ " in name.'
+          timeout: 30s
+        - uuid: e6a7a4658c0346ad85a62f3031db7778
+          name: 'vDCM processing node total bitrate'
+          type: DEPENDENT
+          key: vdcm.proc.bitrate
+          history: 90d
+          units: bps
+          description: 'Total encoded output bitrate of the Processing Node (sum of all ABR profile bitrates across all services, from /bitrates/processing). For SPORTCAST IDC: normal ~36.8 Mbps (4 services × ~9.2 Mbps each). Source: vdcm.services.bitrates proc_bps field.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.proc_bps
+          master_item:
+            key: vdcm.services.bitrates
+          tags:
+            - tag: component
+              value: encoder
+            - tag: scope
+              value: availability
+          triggers:
+            - uuid: dda97958e726442e891d94afbe41a53e
+              expression: 'min(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.proc.bitrate,3m)=0 and nodata(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.proc.bitrate,5m)=0 and last(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.device.vdcm_state)="Active"'
+              name: 'vDCM: all encoding stopped (total output bitrate=0)'
+              priority: DISASTER
+              description: 'Processing Node total encoded output has been zero for 3+ minutes while device state is Active. All ABR/HLS services have stopped encoding. Check input sources and encoder configuration at {$VDCM.URL}.'
+              tags:
+                - tag: component
+                  value: encoder
+                - tag: scope
+                  value: availability
+            - uuid: e2b4d6f8a1c34b89a2b4d6f8a1c34b70
+              expression: 'min(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.proc.bitrate,3m)<{$VIDEO.PROC.BITRATE.WARN} and min(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.proc.bitrate,3m)>0 and last(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.device.vdcm_state)="Active"'
+              name: 'vDCM: total output bitrate dropped (partial service outage)'
+              priority: HIGH
+              description: 'Processing Node total encoded output has dropped below {$VIDEO.PROC.BITRATE.WARN} bps for 3+ minutes but is not zero. Indicates one or more ABR services may have stopped while others continue. Current value: {ITEM.LASTVALUE}. Check {$VDCM.URL} for individual service status.'
+              tags:
+                - tag: component
+                  value: encoder
+                - tag: scope
+                  value: availability
+        - uuid: f3c5e7a9b2d44a18b3c5e7a9b2d44a10
+          name: 'vDCM active encoding services count'
+          type: DEPENDENT
+          key: vdcm.services.count
+          history: 90d
+          description: 'Number of active S-type encoding services currently visible under the Processing Node. Normal value = {$VDCM.SVC.COUNT.MIN}. Drops to 0 if Processing Node is unavailable; drops below expected if a service is removed from the node.'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var obj = JSON.parse(value);
+                  var svcs = obj.services || obj;
+                  return String(svcs.length);
+          master_item:
+            key: vdcm.services.bitrates
+          tags:
+            - tag: component
+              value: encoder
+            - tag: scope
+              value: availability
+          triggers:
+            - uuid: a4b6c8e2f1d34a19a4b6c8e2f1d34a11
+              expression: 'min(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.services.count,3m)<{$VDCM.SVC.COUNT.MIN} and nodata(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.services.count,5m)=0 and last(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.device.vdcm_state)="Active"'
+              name: 'vDCM: fewer encoding services than expected'
+              priority: DISASTER
+              description: 'Number of encoding services visible under Processing Node has dropped below {$VDCM.SVC.COUNT.MIN} for 3+ minutes while vDCM is Active. Expected {$VDCM.SVC.COUNT.MIN} services (SprtGlf1/SprtGlf2/SprtTns/SprtUL). Current count: {ITEM.LASTVALUE}. One or more services may have been removed or have failed to initialise.'
+              tags:
+                - tag: component
+                  value: encoder
+                - tag: scope
+                  value: availability
+        - uuid: c1f3d5a7b2e04928a1c3d5e7b2f40917
+          name: 'vDCM SDI input signal status'
+          type: SCRIPT
+          key: vdcm.sdi.status
+          delay: 2m
+          history: 1h
+          value_type: TEXT
+          params: |
+            var url = '{$VDCM.URL}'.replace(/\/+$/, '');
+            var user = '{$VDCM.USER}';
+            var pass = '{$VDCM.PASS}';
+            var sdiNodes = '{$VDCM.SDI.NODES}'.split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+            if (!url || url.indexOf('http') !== 0) {
+                throw new Error('Invalid {$VDCM.URL}: "' + url + '".');
+            }
+            var login = new HttpRequest();
+            try { login.setopt(64, 0); login.setopt(81, 0); } catch(e) {}
+            login.addHeader('Content-Type: application/x-www-form-urlencoded');
+            login.post(
+                url + '/login_handler?came_from=%2F',
+                'login=' + encodeURIComponent(user) +
+                '&password=' + encodeURIComponent(pass) +
+                '&login_button=Login'
+            );
+            var hdrs = login.getHeaders(true);
+            var cookies = [];
+            Object.keys(hdrs).forEach(function(k) {
+                if (k.toLowerCase() === 'set-cookie') {
+                    var v = hdrs[k];
+                    if (Array.isArray(v)) {
+                        v.forEach(function(c) { cookies.push(c.split(';')[0].trim()); });
+                    } else {
+                        cookies.push(v.split(';')[0].trim());
+                    }
+                }
+            });
+            if (cookies.length === 0) {
+                throw new Error('vDCM login failed: no Set-Cookie. Check {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}.');
+            }
+            var api = new HttpRequest();
+            try { api.setopt(64, 0); api.setopt(81, 0); } catch(e) {}
+            api.addHeader('Content-Type: application/x-www-form-urlencoded');
+            api.addHeader('Cookie: ' + cookies.join('; '));
+            var result = [];
+            sdiNodes.forEach(function(xid, idx) {
+                var resp = api.post(
+                    url + '/service/overview/opennode2',
+                    'xID=' + encodeURIComponent(xid) + '&type='
+                );
+                var signal = 0;
+                var svcName = '';
+                try {
+                    var children = JSON.parse(resp);
+                    if (children.length > 0) {
+                        var ctx = children[0].context || '';
+                        signal = (ctx.indexOf('_129d') !== -1) ? 1 : 0;
+                        var title = children[0].title || '';
+                        svcName = title.split(/[\s(]/)[0];
+                    }
+                } catch(e) {}
+                result.push({ name: 'SDI' + (idx + 1), port: xid, service: svcName, signal: signal });
+            });
+            return JSON.stringify(result);
+          description: 'Queries each SDI stream node via opennode2 to detect signal presence. Returns JSON array: [{"name":"SDI1","port":"T_I:2:0:*:512","service":"SprtUL","signal":1},...]. signal=1 means SDI input has active service mapping (context flag _129d present); signal=0 means no signal or no service. SDI stream xIDs are read from {$VDCM.SDI.NODES} macro (comma-separated). For SPORTCAST IDC: SDI1=SprtUL, SDI2=SprtTns, SDI3=SprtGlf1, SDI4=SprtGlf2.'
+          timeout: 30s
+      discovery_rules:
+        - uuid: b7756feaba024c129c5e212ce70de6de
+          name: 'vDCM encoding services discovery'
+          type: DEPENDENT
+          key: vdcm.services.discovery
+          lifetime: 7d
+          description: 'Automatically discovers all S-type encoding services on this vDCM device by parsing the master item vdcm.services.bitrates. Creates one bitrate item and three triggers per discovered service. Works for any number of services regardless of name (EBC, FTV, SprtGlf1, SprtTns, etc.).'
+          item_prototypes:
+            - uuid: 05faf44d9932411188ffea924a2a4c3b
+              name: '{#SVCNAME} - bitrate'
+              type: DEPENDENT
+              key: 'vdcm.bitrate[{#SVCNAME}]'
+              history: 90d
+              units: bps
+              description: '{#SVCTITLE} encoding service current output bitrate in bps.'
+              tags:
+                - tag: component
+                  value: encoder
+                - tag: service
+                  value: '{#SVCNAME}'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var obj = JSON.parse(value);
+                      var svcs = obj.services || obj;
+                      var name = '{#SVCNAME}';
+                      for (var i = 0; i < svcs.length; i++) {
+                          if (svcs[i].name === name) { return String(svcs[i].bps); }
+                      }
+                      return '0'; // service absent from response = treat as crashed (bps=0)
+              master_item:
+                key: vdcm.services.bitrates
+              trigger_prototypes:
+                - uuid: 5aed7903c9f54158bc6206fbf19237af
+                  expression: 'min(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.bitrate[{#SVCNAME}],3m)<{$VIDEO.BITRATE.MIN} and min(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.bitrate[{#SVCNAME}],3m)>0 and last(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.device.vdcm_state)="Active"'
+                  name: '{#SVCNAME}: bitrate below minimum'
+                  priority: HIGH
+                  description: 'Service {#SVCNAME} ({#SVCTITLE}) bitrate has been critically below {$VIDEO.BITRATE.MIN} bps for 3+ minutes. Urgent action required.'
+                  tags:
+                    - tag: component
+                      value: encoder
+                    - tag: scope
+                      value: service
+                    - tag: service
+                      value: '{#SVCNAME}'
+                - uuid: 8de5074da7164aa2bea6c59a0c71841b
+                  expression: 'min(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.bitrate[{#SVCNAME}],3m)<{$VIDEO.BITRATE.WARN} and min(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.bitrate[{#SVCNAME}],3m)>={$VIDEO.BITRATE.MIN} and last(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.device.vdcm_state)="Active"'
+                  name: '{#SVCNAME}: bitrate is low'
+                  priority: WARNING
+                  description: 'Service {#SVCNAME} ({#SVCTITLE}) bitrate has been below {$VIDEO.BITRATE.WARN} bps for 3+ minutes but above critical minimum. Check input source and encoder.'
+                  tags:
+                    - tag: component
+                      value: encoder
+                    - tag: scope
+                      value: service
+                    - tag: service
+                      value: '{#SVCNAME}'
+                - uuid: 9806650abe5b4544a308e49de5da977b
+                  expression: 'min(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.bitrate[{#SVCNAME}],3m)=0 and nodata(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.bitrate[{#SVCNAME}],5m)=0 and last(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.device.vdcm_state)="Active"'
+                  name: '{#SVCNAME}: stream stopped'
+                  priority: DISASTER
+                  description: 'Service {#SVCNAME} ({#SVCTITLE}) bitrate has been zero for 3+ minutes and device state is Active — single-channel fault. SPORTCAST encoders run continuously, so bitrate=0 always indicates a fault.'
+                  tags:
+                    - tag: component
+                      value: encoder
+                    - tag: scope
+                      value: service
+                    - tag: service
+                      value: '{#SVCNAME}'
+                - uuid: b5d7e9c1a2f44b28b5d7e9c1a2f44b20
+                  expression: 'nodata(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.bitrate[{#SVCNAME}],5m)=1 and last(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.device.vdcm_state)="Active"'
+                  name: '{#SVCNAME}: service missing from encoding node'
+                  priority: DISASTER
+                  description: 'No data collected for service {#SVCNAME} ({#SVCTITLE}) for 5+ minutes while vDCM is Active. The service has disappeared from the Processing Node S-node list — it may have been stopped, crashed, or removed from the configuration. Check {$VDCM.URL} Service Overview.'
+                  tags:
+                    - tag: component
+                      value: encoder
+                    - tag: scope
+                      value: service
+                    - tag: service
+                      value: '{#SVCNAME}'
+          master_item:
+            key: vdcm.services.bitrates
+          graph_prototypes:
+            - uuid: 0616dc870ff3488f90002dde4d557727
+              name: '{#SVCNAME} - output bitrate'
+              graph_items:
+                - color: 1A7C11
+                  item:
+                    host: 'Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC'
+                    key: 'vdcm.bitrate[{#SVCNAME}]'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var obj = JSON.parse(value);
+                  var svcs = obj.services || obj;
+                  return JSON.stringify(svcs.map(function(s) {
+                      return { '{#SVCNAME}': s.name, '{#SVCTITLE}': s.title };
+                  }));
+        - uuid: f2e4b6a8c1d34a87a2f4b6c8d1e3a509
+          name: 'vDCM SDI input signal discovery'
+          type: DEPENDENT
+          key: vdcm.sdi.discovery
+          lifetime: 7d
+          description: 'Discovers SDI input ports from vdcm.sdi.status. Creates one signal item and trigger per SDI port. For SPORTCAST IDC: SDI1(SprtUL), SDI2(SprtTns), SDI3(SprtGlf1), SDI4(SprtGlf2).'
+          item_prototypes:
+            - uuid: a3c5e7b1d24f4b92a3a5e7d1b4f2c609
+              name: '{#SDINAME} ({#SDISVC}) - signal'
+              type: DEPENDENT
+              key: 'vdcm.sdi.signal[{#SDINAME}]'
+              history: 90d
+              description: 'SDI input signal status: 1=present, 0=lost. {#SDINAME} is mapped to encoding service {#SDISVC} at port {#SDIPORT}.'
+              tags:
+                - tag: component
+                  value: encoder
+                - tag: scope
+                  value: availability
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var arr = JSON.parse(value);
+                      var name = '{#SDINAME}';
+                      for (var i = 0; i < arr.length; i++) {
+                          if (arr[i].name === name) { return String(arr[i].signal); }
+                      }
+                      throw new Error(name + ' not found in vdcm.sdi.status response');
+              master_item:
+                key: vdcm.sdi.status
+              trigger_prototypes:
+                - uuid: b4d6f8c2e1a34c07b4d6f8c2e1a34b70
+                  expression: 'min(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.sdi.signal[{#SDINAME}],3m)=0 and nodata(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.sdi.signal[{#SDINAME}],5m)=0 and last(/Synamedia vDCM Encoder by HTTP API - SPORTCAST IDC/vdcm.device.vdcm_state)="Active"'
+                  name: '{#SDINAME} ({#SDISVC}): SDI input signal lost'
+                  priority: HIGH
+                  description: 'SDI input {#SDINAME} for service {#SDISVC} has had no signal for 3+ minutes while vDCM is Active. Check SDI cable and source equipment at {$VDCM.URL}.'
+                  tags:
+                    - tag: component
+                      value: encoder
+                    - tag: scope
+                      value: availability
+          master_item:
+            key: vdcm.sdi.status
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var arr = JSON.parse(value);
+                  return JSON.stringify(arr.map(function(s) {
+                      return { '{#SDINAME}': s.name, '{#SDIPORT}': s.port, '{#SDISVC}': s.service };
+                  }));
+      macros:
+        - macro: '{$VDCM.INPUT.CARDS}'
+          value: 'T_I:2:0,T_I:2:1,T_I:2:2,T_I:2:3'
+          description: >-
+            Comma-separated list of SDI input card xIDs for processing alarm monitoring.
+            For SPORTCAST IDC: T_I:2:0=SprtUL, T_I:2:1=SprtTns, T_I:2:2=SprtGlf1, T_I:2:3=SprtGlf2.
+            Used by vdcm.processing.alarms item.
+        - macro: '{$VDCM.PASS}'
+          type: SECRET_TEXT
+          description: 'vDCM web login password. Set per-host override as Secret macro.'
+        - macro: '{$VDCM.PROC.NODE}'
+          value: 'T_T:2:*:*:e0'
+          description: 'Processing node key containing all S-type encoding services. For SPORTCAST IDC (60.251.153.74), Port 3 output services (SprtGlf1/2/Tns/UL) are under T_O:1:2. If S-type discovery returns no results, check the tree structure in vDCM UI under Service Overview and update this key accordingly.'
+        - macro: '{$VDCM.SDI.NODES}'
+          value: 'T_I:2:0:*:512,T_I:2:1:*:513,T_I:2:2:*:514,T_I:2:3:*:515'
+          description: 'Comma-separated list of SDI stream xID nodes for signal monitoring. For SPORTCAST IDC: SDI1(T_I:2:0:*:512=SprtUL), SDI2(T_I:2:1:*:513=SprtTns), SDI3(T_I:2:2:*:514=SprtGlf1), SDI4(T_I:2:3:*:515=SprtGlf2). Set empty string to disable SDI monitoring.'
+        - macro: '{$VDCM.URL}'
+          description: 'vDCM web UI base URL, no trailing slash. E.g. https://60.251.153.74 or https://61.220.40.194:4431'
+        - macro: '{$VDCM.USER}'
+          value: Administrator
+          description: 'vDCM web login username'
+        - macro: '{$VDCM.SVC.COUNT.MIN}'
+          value: '4'
+          description: 'Minimum expected number of active encoding services under the Processing Node. For SPORTCAST IDC: 4 (SprtGlf1, SprtGlf2, SprtTns, SprtUL). Trigger fires if active service count drops below this value. Override per host if the number of services differs.'
+        - macro: '{$VIDEO.BITRATE.MIN}'
+          value: '7000000'
+          description: 'Critical threshold in bps for per-service total ABR bitrate. Trigger fires when service bitrate drops below this (but > 0). For SPORTCAST IDC each service encodes 4 profiles totalling ~9.2 Mbps (5000+2500+800+400 kbps). Set 7000000 (7 Mbps) as critical floor. Override per host as needed.'
+        - macro: '{$VIDEO.BITRATE.WARN}'
+          value: '8000000'
+          description: 'Warning threshold in bps for per-service total ABR bitrate. For SPORTCAST IDC normal ~9.2 Mbps per service; 8000000 (8 Mbps) warns before critical. Override per host to match expected total per-service bitrate.'
+        - macro: '{$VIDEO.PROC.BITRATE.WARN}'
+          value: '27600000'
+          description: 'Processing Node total bitrate partial-drop threshold in bps. Default 27,600,000 bps (27.6 Mbps) = ~75% of SPORTCAST normal 36.8 Mbps, representing approximately 1 of 4 services offline. Trigger fires (HIGH) when total bitrate drops below this but is not zero. Override per host to match expected total output.'

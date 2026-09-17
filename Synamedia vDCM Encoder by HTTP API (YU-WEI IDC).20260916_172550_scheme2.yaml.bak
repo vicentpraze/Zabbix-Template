@@ -1,0 +1,1447 @@
+zabbix_export:
+  version: '7.4'
+  template_groups:
+    - uuid: c7691cb0ae02412a87bcda2e1db5184c
+      name: 'Templates/Network devices'
+  templates:
+    - uuid: 1f95f88f2d0941818b184325e2bcd53d
+      template: 'Synamedia vDCM Encoder by HTTP API - YU-WEI IDC'
+      name: 'Synamedia vDCM Encoder by HTTP API (YU-WEI IDC)'
+      description: |
+        Synamedia vDCM HTTP API monitor for YU-WEI IDC (litv_tran1/tran2).
+        Output bitrate: LLD via /service/overview/opennode2 (nodetype=S, {$VDCM.PROC.NODE}). Input bitrate: LLD via /bitrates/input/refresh + get_rows ({$VDCM.INPUT.CARDS}). Alarms: /status/alarms/get_rows + /status/processing/get_rows (background noise filtered). Device health: /load_alarm_footer → alarm_count, device_state, vdcm_state.
+      vendor:
+        name: LiTV
+        version: 7.4.11
+      groups:
+        - name: 'Templates/Network devices'
+      items:
+        - uuid: c1d2e3f4a5b6470893c1d2e3f4a5b6c7
+          name: 'vDCM SNMP Trap (trapControlMsgTrap)'
+          type: SNMP_TRAP
+          key: 'snmptrap[trapControlMsgTrap]'
+          history: 7d
+          value_type: LOG
+          description: |
+            Receives all Synamedia vDCM SNMP traps (trapControlMsgTrap / trapControlMsgTrap2).
+            Single item for all severities — prevents duplicate alerts when vDCM sends the same fault at multiple severity levels.
+            Output: "Channel: AlarmText" (RAISED) or "Channel: AlarmText — Cleared" (CLEARED).
+            Channel name resolution priority: GroupName → UserTag → {$SNMP.IP.MAP} lookup → raw location.
+            Noise filtered: PTS Discontinuity, UDP/TS Stream Loss, Input Signal Loss.
+            Prerequisites: StartSNMPTrapper=1, SNMPTrapperFile=/var/log/snmptrap/snmptrap.log, host SNMP interface configured.
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  // Parse Synamedia vDCM SNMP trap from /var/log/snmptrap/snmptrap.log.
+                  // Single item handles all severities — SINGLE trigger prevents duplicate notifications
+                  // when vDCM sends the same fault at multiple severity levels (e.g. sev:2 then sev:5).
+                  function extractStringLike(rawValue, fieldName) {
+                    var direct = rawValue.match(new RegExp(fieldName + '\\.\\d+\\s+type=\\d+\\s+value=(?:STRING|OCTET STRING):\\s*"([^"]+)"', 'i'));
+                    if (direct) return direct[1].trim();
+                    var fallback = rawValue.match(new RegExp(fieldName + '\\.\\d+\\s+type=\\d+\\s+value=(?:STRING|OCTET STRING):\\s*([^\\r\\n]+)', 'i'));
+                    if (fallback) {
+                      var val = fallback[1].trim();
+                      if (val === '""') return '';
+                      return val.replace(/^"|"$/g, '').trim();
+                    }
+                    return '';
+                  }
+                  function extractIntegerLike(rawValue, fieldName) {
+                    var match = rawValue.match(new RegExp(fieldName + '\\.\\d+\\s+type=\\d+\\s+value=INTEGER:\\s*(\\d+)', 'i'));
+                    if (match) return match[1];
+                    return '';
+                  }
+                  var rawValue = value || '';
+                  var mBeh = extractIntegerLike(rawValue, 'msgBehaviour');
+                  var mTxt = extractStringLike(rawValue, 'msgText');
+                  var mSub = extractStringLike(rawValue, 'msgSubject');
+                  var mDet = extractStringLike(rawValue, 'msgDetail');
+                  var mStat = extractIntegerLike(rawValue, 'msgStatus');
+                  if (!mBeh || !mTxt) return '';
+                  // Discard msgBehaviour=0 (instantaneous/transient): no clear counterpart, would latch trigger open
+                  if (mBeh === '0') return '';
+                  // Noise classification:
+                  // ALWAYS_NOISE: inherently meaningless regardless of channel
+                  // SLOT_NOISE:   only noise when channel is unknown (empty port slot); real if channel is identified
+                  var ALWAYS_NOISE = ['Input Signal Loss', 'No Input Signal'];
+                  var SLOT_NOISE   = ['PTS Discontinuity', 'UDP Stream Loss', 'TS Stream Loss'];
+                  var trapText = (mTxt || '').replace(/\s+/g, ' ').trim();
+                  var trapTextNorm = trapText.replace(/^\s*[^:]+:\s*/i, '').replace(/\s+/g, ' ').trim();
+                  var isAlwaysNoise = ALWAYS_NOISE.some(function(n){ return trapTextNorm.indexOf(n) >= 0 || trapText.indexOf(n) >= 0; });
+                  var isSlotNoise = SLOT_NOISE.some(function(n){ return trapTextNorm.indexOf(n) >= 0 || trapText.indexOf(n) >= 0; });
+                  var isParserNoise = trapText === '' || trapText === 'OK' || trapText.indexOf('ERROR:') === 0 || trapText.indexOf('TypeError') >= 0 || trapText.indexOf('Exception') >= 0 || trapText.indexOf('undefined') >= 0;
+                  if (isAlwaysNoise || isParserNoise) return '';
+                  // BENIGN_REASON: HLS packager segment-duration variance is a QoS statistic, not a service fault.
+                  // Self-clears within seconds; does not affect CDN or player. Filter both raise and cleared to keep counts balanced at zero.
+                  var BENIGN_REASON = /Measured\s+segment\s+duration\s+bigger\s+than\s+expected/i;
+                  if (mDet && BENIGN_REASON.test(mDet)) return '';
+                  // Channel name resolution: GroupName → UserTag → IP map → TS fallback
+                  var groupName = '';
+                  var sourceText = [mTxt, mSub, mDet].filter(Boolean).join(' ');
+                  function resolveUserTag(value) {
+                    if (!value) return '';
+                    var match = value.match(/UserTag\s+([^,\r\n]+)/i);
+                    if (!match) return '';
+                    var tag = match[1].trim().replace(/\s*\(.*$/, '').trim();
+                    return tag;
+                  }
+                  // Extract TS/Port/Service up-front so we can use TS as a clean fallback identifier
+                  var tsIp = '';
+                  var portNo = '';
+                  var serviceNo = '';
+                  var tsMatch = sourceText.match(/TS(?:\s*[:=])?\s*(\d+\.\d+\.\d+\.\d+:\d+)/i);
+                  if (tsMatch) tsIp = tsMatch[1];
+                  var portMatch = sourceText.match(/Port\s+(\d+)/i);
+                  if (portMatch) portNo = portMatch[1];
+                  var serviceMatch = sourceText.match(/Service\s*(\d+)/i);
+                  if (serviceMatch) serviceNo = serviceMatch[1];
+                  if (mDet) {
+                    var gm = mDet.match(/GroupName\s*=\s*([^=;\r\n]+)/i);
+                    if (gm) groupName = gm[1].trim();
+                  }
+                  if (!groupName && mSub) {
+                    var gmSub = mSub.match(/GroupName\s*=\s*([^=;\r\n]+)/i);
+                    if (gmSub) groupName = gmSub[1].trim();
+                  }
+                  if (!groupName) {
+                    var userTag = resolveUserTag(mSub) || resolveUserTag(mDet) || resolveUserTag(sourceText);
+                    if (userTag) groupName = userTag;
+                  }
+                  if (!groupName && (tsIp || portNo)) {
+                    try {
+                      var ipMap = JSON.parse('{$SNMP.IP.MAP}');
+                      if (tsIp) {
+                        groupName = ipMap[tsIp] || ipMap[':'+tsIp.split(':')[1]] || '';
+                        if (!groupName && serviceNo) {
+                          groupName = ipMap[tsIp + '|' + serviceNo] || ipMap[tsIp + ':' + serviceNo] || ipMap[':' + tsIp.split(':')[1] + '|' + serviceNo] || '';
+                        }
+                      }
+                      if (!groupName && portNo) groupName = ipMap[':'+portNo] || '';
+                    } catch(e){}
+                  }
+                  // Cross-check: drop traps whose channel does not belong to this host.
+                  // The Synamedia device stamps SNMP agent-addr incorrectly, so tran2 alarms
+                  // arrive tagged as tran1. {$SNMP.IP.MAP} lists channels this host really owns.
+                  // Auto-generated placeholder names (Service01, Program 1, etc.) are ignored
+                  // when building the owned set to avoid false-positive ownership matches.
+                  if (groupName) {
+                    try {
+                      var m = JSON.parse('{$SNMP.IP.MAP}');
+                      var placeholder = /^(service\d+|program(\s*\d+)?|channel\d+|input\d+|output\d+)$/i;
+                      var owned = {};
+                      Object.keys(m).forEach(function(k){
+                        var raw = String(m[k]||'').trim();
+                        if (placeholder.test(raw)) return;
+                        var v = raw.toLowerCase().replace(/[^a-z0-9]/g,'');
+                        if (v.length >= 3) owned[v] = 1;
+                      });
+                      var norm = groupName.toLowerCase().replace(/[^a-z0-9]/g,'');
+                      var match = norm && owned[norm];
+                      if (!match && norm) {
+                        for (var kk in owned) {
+                          if (kk.length >= 4 && (norm.indexOf(kk) === 0 || kk.indexOf(norm) === 0)) { match = 1; break; }
+                        }
+                      }
+                      if (norm && !match && Object.keys(owned).length > 0) return '';
+                    } catch(e) {}
+                  }
+                  // Suppress SLOT_NOISE only when no channel name (empty port slot)
+                  if (!groupName && isSlotNoise) return '';
+                  // Never expose raw "Board X, Port Y" — operators find it confusing.
+                  // Prefer channel name; else use TS as a stable identifier; else port.
+                  var identifier = groupName || (tsIp ? 'TS ' + tsIp : (portNo ? 'Port ' + portNo : ''));
+                  var base = identifier ? identifier + ': ' + trapText : trapText;
+                  // msgBehaviour=1: explicit cleared (other firmware variants)
+                  if (mBeh === '1') return base + ' — Cleared';
+                  // msgBehaviour=2 + msgStatus=0: real clear event for Synamedia traps.
+                  // Do not discard it; otherwise the trigger never recovers even though the device has already cleared the fault.
+                  if (mBeh === '2' && mStat === '0') return base + ' — Cleared';
+                  return base;
+        - uuid: b3c4d5e6f7a8491083b3c4d5e6f7a8b4
+          name: 'vDCM device alarm details (non-background)'
+          type: DEPENDENT
+          key: vdcm.alarms.detail
+          history: 90d
+          value_type: TEXT
+          description: |
+            Queries /status/alarms/get_rows for all active alarms and filters out permanent background noise. Returns "OK" when only background noise is present, or comma-separated alarm descriptions for non-background alarms. Background noise on litv_tran1/tran2 (always present, normal):
+              - PTS Discontinuity: RTMP VBR streams
+              - UDP Stream Loss / TS Stream Loss: unused/empty RTMP port slots
+              - Input Signal Loss / No Input Signal: empty port slots
+            Non-background alarms indicate real faults: Equipment failure, Environmental alerts, or unexpected Communication faults. For encoding-layer (Processing class) faults with channel names, see vdcm.processing.alarms which queries the Processing status page.
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.alarms_detail
+          master_item:
+            key: vdcm.data
+          triggers:
+            - uuid: b7d82f5d2d1d4e3aa1ce28386d5d61b2
+              expression: 'last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.alarms.detail)<>"OK" and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.alarms.detail)<>"" and find(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.alarms.detail,,"like","ERROR:")=0'
+              recovery_mode: RECOVERY_EXPRESSION
+              recovery_expression: 'last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.alarms.detail)="OK" or last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.alarms.detail)="" or find(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.alarms.detail,,"like","ERROR:")=1'
+              name: 'vDCM: real alarm text active (current: {ITEM.LASTVALUE})'
+              priority: AVERAGE
+              description: 'Fires only when the parser returns a real alarm message. Ignores empty values and parser failures such as "ERROR: TypeError...". This is the actual alarm text from the vDCM API, not a derived count.'
+              manual_close: 'YES'
+        - uuid: 7f5574cf70f24fbe8d44bb22a4ad3d5b
+          name: 'vDCM master data (all-in-one)'
+          type: SCRIPT
+          key: vdcm.data
+          delay: 30s
+          history: 1h
+          value_type: TEXT
+          params: |
+            // vDCM Master Data Collector — YU-WEI IDC
+            var url='{$VDCM.URL}'.replace(/\/+$/,''),user='{$VDCM.USER}',pass='{$VDCM.PASS}';
+            var cards='{$VDCM.INPUT.CARDS}'.split(',').map(function(s){return s.trim();}).filter(Boolean);
+            var procNode='{$VDCM.PROC.NODE}';
+            if(!url||url.indexOf('http')!==0)throw new Error('Invalid {$VDCM.URL}: "'+url+'"');
+            function _doLogin(){var lg=new HttpRequest();try{lg.setopt(64,0);}catch(e){}try{lg.setopt(81,0);}catch(e){}try{lg.setopt(52,0);}catch(e){}lg.addHeader('Content-Type: application/x-www-form-urlencoded');lg.post(url+'/login_handler?came_from=%2F','login='+encodeURIComponent(user)+'&password='+encodeURIComponent(pass)+'&login_button=Login');var ck=[];try{var hd=lg.getHeaders(false);if(hd&&typeof hd==='object'&&!Array.isArray(hd)){Object.keys(hd).forEach(function(k){if(k.toLowerCase()==='set-cookie'){var v=hd[k];(Array.isArray(v)?v:[v]).forEach(function(c){var p=c.split(';')[0].trim();if(p)ck.push(p);})}});}}catch(e){}if(ck.length===0){try{var rh=lg.getHeaders(true);if(typeof rh!=='string')rh=String(rh);(rh.match(/Set-Cookie:\s*([^\r\n]+)/ig)||[]).forEach(function(m){var p=m.replace(/^Set-Cookie:\s*/i,'').split(';')[0].trim();if(p)ck.push(p);});}catch(e){}}return ck;}
+            var cookies=_doLogin();
+            if(cookies.length===0){try{Duktape.gc();}catch(e){}cookies=_doLogin();}
+            if(cookies.length===0)throw new Error('Login failed after retry. Check {$VDCM.URL}/{$VDCM.USER}/{$VDCM.PASS}.');
+            var api=new HttpRequest();
+            try{api.setopt(64,0);}catch(e){}try{api.setopt(81,0);}catch(e){}
+            try{api.setopt(13,30);}catch(e){}try{api.setopt(78,10);}catch(e){}
+            api.addHeader('Content-Type: application/x-www-form-urlencoded');
+            api.addHeader('Cookie: '+cookies.join('; '));
+            function _logout(){}
+            var _sv=api.get(url+'/load_alarm_footer');
+            if(_sv&&_sv.indexOf('action="/login_handler"')>=0)throw new Error('Session invalid immediately after login (login page returned). Check vDCM session limit or concurrent login policy.');
+            function _d(r){return String(r||'').replace(/&quot;/g,'"').replace(/&amp;/g,'&').replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>');}
+            function _t(pg,nm){var mk=nm+"='",ii=(pg||'').indexOf(mk);if(ii<0)return[];var jj=pg.indexOf("';",ii+mk.length);if(jj<0)return[];try{return JSON.parse(_d(pg.substring(ii+mk.length,jj)));}catch(e){return[];}}
+            function _h(s){return String(s||'').replace(/<[^>]+>/g,'').trim();}
+            var R_dev={alarm_count:-1,device_state:'unknown',vdcm_state:'unknown'};
+            try{var _dr=_sv;if(_dr){var _am=_dr.match(/device_status'\)\.textContent\s*=\s*'([^']*)'/),_sm=_dr.match(/device_state'\)\.textContent\s*=\s*'([^']*)'/),_vm=_dr.match(/vdcm_state'\)\.textContent\s*=\s*'([^']*)'/);R_dev={alarm_count:_am?parseInt(_am[1],10):-1,device_state:_sm?_sm[1]:'unknown',vdcm_state:_vm?_vm[1]:'unknown'};}}catch(e){}
+            var R_alm='ERROR';
+            try{
+            var _sp=null;
+            var NOISE=['PTS Discontinuity','UDP Stream Loss','TS Stream Loss','Destination IP Not Reachable Through ICMP'];
+            var _ar=api.post(url+'/status/alarms/get_rows','table_id=status_alarm_table&paging_info_status_alarm_table='+encodeURIComponent('{"start_row":0,"rows_to_show":500}'));
+            var _ac=api.getStatus(),_alr=null;
+            if(_ar&&_ac!==204){var _mk="tbl_data_status_alarm_table='",_i=_ar.indexOf(_mk);if(_i>=0){var _s=_i+_mk.length,_e=_ar.indexOf("';",_s);if(_e>=0)try{_alr=JSON.parse(_d(_ar.substring(_s,_e)));}catch(e){}}}
+            if(_alr===null){
+            _sp=api.get(url+'/status');var _tot=0;
+            ['tbl_data_tbldevicealarms','tbl_data_tblioalarms'].forEach(function(t){_t(_sp,t).forEach(function(r){(r.values||[]).forEach(function(c){var s=(typeof c==='object'&&c!==null)?JSON.stringify(c):String(c||'');if(s.charAt(0)==='{'){var _oc=null;try{_oc=JSON.parse(s);}catch(e){try{_oc=JSON.parse(_d(s));}catch(e2){}}if(_oc&&_oc['class']==='LinkControl')_tot+=parseInt(_oc.content,10)||0;}});});});
+            if(_tot>0){var _dp=api.get(url+'/status/device'),_dr2=_t(_dp,'tbl_data_device_detail_table');_alr=_dr2.length>0?_dr2:_t(_sp,'tbl_data_tbldevicealarms');}
+            else _alr=_t(_sp,'tbl_data_tbldevicealarms');
+            }
+            var _as={},_ap=[];
+            _alr.forEach(function(row){var v=row.values||[],_lc2=false,_tx=[];v.forEach(function(cell){var lc=(cell&&typeof cell==='object')?cell:null;if(!lc){var s=String(cell||'');if(s.charAt(0)==='{'){try{lc=JSON.parse(s);}catch(e){try{lc=JSON.parse(s.replace(/\\"/g,'"'));}catch(e2){try{lc=JSON.parse(_d(s));}catch(e3){}}}}}if(lc&&lc['class']==='LinkControl'){_lc2=true;return;}var t=_h(String(cell||''));var tn=t.replace(/\\"/g,'"');if(tn.indexOf('"class":"LinkControl"')>=0||tn.indexOf('"class": "LinkControl"')>=0){_lc2=true;return;}if(t.length>1&&!/^\d+$/.test(t))_tx.push(t);});_tx=_tx.filter(function(x){if(x.indexOf('LinkControl')<0)return true;var xn=x.replace(/\\"/g,'"');if(xn.indexOf('"class":"LinkControl"')>=0||xn.indexOf('"class": "LinkControl"')>=0)return false;try{var _o=JSON.parse(xn);return _o['class']!=='LinkControl';}catch(e){return true;}});if(NOISE.some(function(n){return _tx.some(function(t){return t.indexOf(n)>=0;})})||_lc2)return;if(_tx.length>0){var e=_tx.join(' | ');if(!_as[e]){_as[e]=true;_ap.push(e);}}});
+            if(!_sp)_sp=api.get(url+'/status');
+            var _IOCAT={'input?filter=TS':'Input-TS','output?filter=TS':'Out-TS','output?filter=Packager':'Out-Pkg'};
+            function _td(html,nm){var mk=nm+"='",ii=(html||'').indexOf(mk);if(ii<0)return[];var jj=html.indexOf("';",ii+mk.length);if(jj<0)return[];try{return JSON.parse(_d(html.substring(ii+mk.length,jj)).replace(/\\'/g,"'"));}catch(e){return[];}}
+            try{_t(_sp,'tbl_data_tblioalarms').forEach(function(row){var v=row.values||[];var _pn=_h(String(v[1]||v[0]||''));v.forEach(function(cell){var s=String(cell||'');if(s.charAt(0)!=='{')return;try{var o=JSON.parse(s.replace(/\\"/g,'"'));var _cnt=parseInt(o.content,10)||0;if(_cnt<=0||o.class!=='LinkControl')return;var _lnk=o.link||'';var _cat=null;for(var _k in _IOCAT){if(_lnk.indexOf(_k)>=0){_cat=_IOCAT[_k];break;}}if(!_cat)return;var _pfx=_lnk.indexOf('input')>=0?'input':'output';var _xm=_lnk.match(/s_xID=([^&'"]+)/);if(!_xm)return;var _xid=decodeURIComponent(_xm[1]);if(!_nm_all_built){try{var _onx=api.post(url+'/service/overview/opennode2','xID='+encodeURIComponent(_xid));_last_xid=_xid;var _nq=JSON.parse(_onx).slice();while(_nq.length>0){var _nn=_nq.shift();var t=_nn.title||'';
+            var mi=t.match(/(\d+\.\d+\.\d+\.\d+:\d+)/);if(mi){var nm2=_h(t.replace(/\s*\(.*/,''));if(nm2&&mi[1])_nm_all[mi[1]]=nm2;}var mp_r=t.match(/\((RTP|UDP|RTMP)\)\(:([0-9]+)\)/);if(mp_r){var nm_r=_h(t.replace(/\s*\(.*/,''));if(nm_r&&mp_r[2])_nm_all[':'+mp_r[2]]=nm_r;}var mt_r=t.match(/TS\s+ID:\d+\(:(\d+)\)/);if(mt_r){var nm_ts=_h(t.replace(/\s*\(.*/,''));if(nm_ts&&mt_r[1]&&!_nm_all[':'+mt_r[1]])_nm_all[':'+mt_r[1]]=nm_ts;}if(_nn.children&&Array.isArray(_nn.children))_nq=_nq.concat(_nn.children);}_nm_all_built=true;}catch(e){}}var _flt=(_lnk.match(/filter=(\w+)/)||['','TS'])[1];
+            var _l2tid=_pfx+'_table';var _l2r=api.post(url+'/status/'+_pfx+'/get_rows?s_xID='+encodeURIComponent(_xid)+'&filter='+_flt,'table_id='+_l2tid+'&paging_info_'+_l2tid+'='+encodeURIComponent('{"start_row":0,"rows_to_show":5}'));var _streams=_td(_l2r,'tbl_data_'+_l2tid);if(_streams.length===0){var _CATLABEL={'Input-TS':'Input TS','Input-Svc':'Input Service','Out-Pkg':'Output Packager','Out-TS':'Output TS','Out-Svc':'Output Service'};var _catLabel=_CATLABEL[_cat]||_cat;var _m0=_catLabel+': '+_cnt+' alarm'+(_cnt>1?'s':'');if(_cat.indexOf('Out-')===0||_cat==='Out-Pkg'){try{var _on=api.post(url+'/service/overview/opennode2','xID='+encodeURIComponent(_xid)+'&type=S');var _svcs=[];JSON.parse(_on).forEach(function(n){var t=(n.title||'').trim();if(t&&t.indexOf('<')<0&&t.indexOf('SEARCH')<0&&_svcs.length<5)_svcs.push(t);});if(_svcs.length>0)_m0=_catLabel+' ['+_svcs.join(',')+(_svcs.length>=5?'...':'')+']'+': '+_cnt+' alarm'+(_cnt>1?'s':'');}catch(e){}}if(!_as[_m0]){_as[_m0]=true;_ap.push(_m0);}return;}
+            var _nm={};try{var _on2=api.post(url+'/service/overview/opennode2','xID='+encodeURIComponent(_xid));function _parseNode(n){var t=_h(n.title||'');var mi=t.match(/\((\d+\.\d+\.\d+\.\d+:\d+)\)/);if(mi){var nm2=t.replace(/\s*\(.*$/,'').trim();if(nm2&&mi[1])_nm[mi[1]]=nm2;}var mp=t.match(/\((?:RTP|UDP|RTMP)?\)\(:([0-9]+)\)/);if(mp){var nm3=t.replace(/\s*\(.*$/,'').trim();if(nm3&&mp[1])_nm[':'+mp[1]]=nm3;}var ms=t.match(/TS\s+ID:\d+\(:([0-9]+)\)/);if(ms){var nm4=t.replace(/\s*\(.*$/,'').trim();if(nm4&&ms[1])_nm[':'+ms[1]]=nm4;}}JSON.parse(_on2).forEach(function(n){_parseNode(n);if(n.children&&Array.isArray(n.children))n.children.forEach(_parseNode);});try{var _no=JSON.parse('{$INPUT.NAME.MAP}');Object.keys(_nm).forEach(function(a){if(_no[_nm[a]])_nm[a]=_no[_nm[a]];});}catch(e){}}catch(e){}if(_pfx==='input'){try{api.get(url+'/bitrates/input/refresh?s_xID='+encodeURIComponent(_xid)+'&filter=Service');var _nmr=api.post(url+'/bitrates/input/get_rows?s_xID='+encodeURIComponent(_xid)+'&filter=Service','table_id=bitrates_serv_input_table&paging_info_bitrates_serv_input_table='+encodeURIComponent('{"start_row":0,"rows_to_show":100}'));_t(_nmr,'tbl_data_bitrates_serv_input_table').forEach(function(nr){var nv=nr.values||[];var _ni=String(nv[2]||'').trim();var _np=String(nv[3]||'').trim();var _nn=String(nv[8]||'').trim();if(_ni&&_np&&_nn&&!_nm[_ni+':'+_np])_nm[_ni+':'+_np]=_nn;});}catch(e){}}
+            var _ms=null;for(var _si=0;_si<_streams.length&&_si<2;_si++){var _sv=_streams[_si].values||[];if(String(_sv[0]||'').indexOf('major')>=0||String(_sv[0]||'').indexOf('warning')>=0){_ms=_sv;break;}}if(!_ms)_ms=(_streams[0].values||[]);
+            var _dtxt=null;if(_ms){var _dlnk=null;_ms.forEach(function(c){if(String(c||'').indexOf('status/detail')>=0)_dlnk=String(c);});if(_dlnk){var _dxm=_dlnk.match(/s_xID=([^&'"]+)/);var _dsm=_dlnk.match(/s_type=(\w+)/);if(_dxm){var _dxid=decodeURIComponent(_dxm[1]);var _dst=_dsm?_dsm[1]:'TS';var _dfm=_dlnk.match(/filter=(\w+)/);var _dflt=_dfm?_dfm[1]:_dst;var _dtid='status_detail_table';var _dr=api.post(url+'/status/detail/get_rows?s_xID='+encodeURIComponent(_dxid)+'&s_type='+_dst+'&filter='+_dflt,'table_id='+_dtid+'&paging_info_'+_dtid+'='+encodeURIComponent('{"start_row":0,"rows_to_show":10}'));var _dts=[],_dtChk=0;var _pkgDetailRe=/Packager|Output Packager|Origin Server|Not Connected|Package Origin/i;_td(_dr,'tbl_data_'+_dtid).forEach(function(drow){var dv=drow.values||[];var _atype=_h(String(dv[1]||'')).replace(/<[^>]*>/g,'').trim();var _astatus=String(dv[5]||dv[4]||'');if(_atype.length>3&&_astatus.indexOf('Cleared')<0&&!_atype.startsWith('status_')&&!_atype.startsWith('fi-')){_dtChk++;var _isPackagerDetail=_pkgDetailRe.test(_atype)||_pkgDetailRe.test(_astatus)||_dst==='Packager'||_cat==='Out-Pkg';if(NOISE.indexOf(_atype)<0||_isPackagerDetail){var _arm=_astatus.match(/Reason=([^=]+)=/);var _atxt=_arm?_atype+': '+_arm[1].trim():_atype;if(_dts.indexOf(_atxt)<0){if(_isPackagerDetail||_atxt.toLowerCase().indexOf('packager')>=0)_dts.push(_atxt);else if(NOISE.indexOf(_atype)<0)_dts.push(_atxt);}}}});if(_dts.length>0)_dtxt=_dts.slice(0,4).join(', ');else if(_dtChk>0&&!(_dst==='Packager'||_cat==='Out-Pkg'))return;}}}
+            var _sids=[];_streams.slice(0,3).forEach(function(sr){var sv=sr.values||[];var _sip='';var _sp2=0;sv.forEach(function(c){if(typeof c==='number'&&c>=100&&c<=65534&&_sp2===0)_sp2=c;if(typeof c==='string'&&/^\d+\.\d+\.\d+\.\d+$/.test(c)&&!_sip)_sip=c;});var _key=(_sip&&_sip!=='127.0.0.1'&&_sip!=='0.0.0.0')?_sip+':'+_sp2:(_sp2?':'+_sp2:'');var _sname=_nm[_sip+':'+_sp2]||'';if(_key){var _sid=_sname?_key+' ('+_sname+')':_key;_sids.push(_sid);}});if(_streams.length>3)_sids.push('...');if(_sids.length===0&&_ms){for(var _vi=0;_vi<_ms.length;_vi++){var _vc=String(_ms[_vi]||'').trim();if(_vc.length>2&&!_vc.startsWith('status')&&!_vc.startsWith('fi-')&&_vc.indexOf('/')<0&&_vc.indexOf('?')<0&&!/^[\d\s]+$/.test(_vc)&&_vc!=='None'){_sids.push(_vc);break;}}}
+            var _sname_first='';_sids.forEach(function(sid){if(!_sname_first&&sid.indexOf('(')>=0){var _nm2=sid.match(/\(([^)]+)\)/);if(_nm2)_sname_first=_nm2[1];}});var _CATLBL={'Input-TS':'Input TS','Input-Svc':'Input Service','Out-Pkg':'Output Packager','Out-TS':'Output TS','Out-Svc':'Output Service'};var _body=_dtxt?_dtxt:(_CATLBL[_cat]||_cat)+': '+_cnt+' alarm'+(_cnt>1?'s':'');var _identifier='';if(_sids.length>0){var _s0=_sids[0];var _sm=_s0.match(/^(.+?)\s+\((.+)\)$/);_identifier=_sm?(_sm[2]+'('+_sm[1]+')'):_s0;}var _msg=_identifier?(_identifier+': '+_body):_body;if(!_as[_msg]){_as[_msg]=true;_ap.push(_msg);}}catch(e){}});});}catch(e){}
+            _ap=_ap.filter(function(e){var en=e.replace(/\\"/g,'"');return en.indexOf('"class":"LinkControl"')<0&&en.indexOf('"class": "LinkControl"')<0;});
+            R_alm=_ap.length>0?_ap.join('\n'):'OK';
+            var R_pkg='OK';
+            try{
+              var _pkgMsgs = _ap.filter(function(msg){ return /Out-Pkg|Output Packager|Packager|Origin Server|Not Connected/i.test(msg); });
+              R_pkg = _pkgMsgs.length>0 ? _pkgMsgs.join(', ') : 'OK';
+            } catch(e) { R_pkg='ERROR: '+String(e); }
+            var _ca_alm={};_ap.forEach(function(msg){var ci=msg.indexOf(': ');if(ci<0)return;var ch=msg.substring(0,ci),alarm=msg.substring(ci+2);if(ch.indexOf('{')>=0){var _cc=ch.substring(0,ch.indexOf('{')).replace(/\s*\|?\s*$/,'').trim();if(!_cc)return;var _ci=_cc.replace(/\(/g,'_').replace(/\)/g,'').replace(/[^a-zA-Z0-9.]/g,'_').replace(/_+/g,'_').replace(/^_|_$/g,'');_ca_alm[_ci]={id:_ci,ch:_cc,alarm:msg};return;}var id=ch.replace(/\(/g,'_').replace(/\)/g,'').replace(/[^a-zA-Z0-9.]/g,'_').replace(/_+/g,'_').replace(/^_|_$/g,'');_ca_alm[id]={id:id,ch:ch,alarm:alarm};});Object.keys(_nm_all).forEach(function(addr){var name=_nm_all[addr];if(!name)return;var ch=name+'('+addr+')';var id=ch.replace(/\(/g,'_').replace(/\)/g,'').replace(/[^a-zA-Z0-9.]/g,'_').replace(/_+/g,'_').replace(/^_|_$/g,'');if(!_ca_alm[id])_ca_alm[id]={id:id,ch:ch,alarm:''};});
+            }catch(e){R_alm='ERROR: '+String(e); R_pkg='ERROR: '+String(e);}
+            var R_proc='ERROR';
+            try{var _pa=[];cards.forEach(function(card){var _pe=encodeURIComponent(card),_pr=api.post(url+'/status/processing/get_rows?s_xID='+_pe,'table_id=processing_table&paging_info_processing_table='+encodeURIComponent('{"start_row":0,"rows_to_show":500}'));if(!_pr||_pr.indexOf('No Processing Alarms')>=0)return;_t(_pr,'tbl_data_processing_table').forEach(function(row){var v=row.values||[],svc=_h(v[3]),at=_h(v[4]);if(/\(\d+x\d+/.test(svc)||!svc||/^fi-/.test(svc)||/^\d+$/.test(svc))return;_pa.push(at?svc+': '+at:svc);});});if(_pa.length===0)R_proc='OK';else{var _ps={};R_proc=_pa.filter(function(a){if(_ps[a])return false;_ps[a]=true;return true;}).join(', ');};}catch(e){R_proc='ERROR: '+String(e);}
+            var R_svc={proc_bps:0,services:[]};
+            try{var _se=encodeURIComponent(procNode);api.get(url+'/bitrates/processing/refresh?s_xID='+_se+'&s_type=');var _sr2=api.post(url+'/bitrates/processing/get_rows?s_xID='+_se+'&s_type=','table_id=bitrates_processing_table&paging_info_bitrates_processing_table='+encodeURIComponent('{"start_row":0,"rows_to_show":500}'));if(_sr2){var _sv=[],_sb=0;_t(_sr2,'tbl_data_bitrates_processing_table').forEach(function(row){var v=row.values||[],nm=String(v[2]||'').trim(),cr=parseFloat(String(v[3]||'').trim())||0;if(!nm||cr<=0)return;var b=Math.round(cr*1000000);_sv.push({name:nm,bps:b});_sb+=b;});if(_sv.length>0)R_svc={proc_bps:_sb,services:_sv};}}catch(e){}
+            var _nm_all={},_nm_all_built=false,_last_xid='';_nm_all[':26000']='mnews-hls';_nm_all[':26001']='mnews-hls';var R_ib=[];
+            try{
+            var _oc='{$VDCM.OUTPUT.CARD}',_asm={},_pbr={};
+            try{var _snr=api.post(url+'/service/overview/opennode2','xID='+encodeURIComponent(procNode)+'&type=S');var _sn=JSON.parse(_snr),_sc={};_sn.forEach(function(n){var m=(n.title||'').match(/\((\d+)\)/);if(m)_sc[m[1]]=(_sc[m[1]]||0)+1;});_sn.forEach(function(n){var m=(n.title||'').match(/\((\d+)\)/);if(m&&_sc[m[1]]===1){var sn=(n.title||'').split('(')[0].trim();if(sn)_asm[m[1]]=sn;}var bm=(n.tooltip||'').match(/cur:\s*([\d.]+)/);if(bm){var kbps=Math.round(parseFloat(bm[1])*1e6/1e3);var fn=(n.title||'').split('(')[0].trim();if(fn){_pbr[fn]=kbps;var nh=fn.replace(/#\d+$/,'').trim();if(nh!==fn&&nh)_pbr[nh]=kbps;}}});}catch(e){}
+            var _nm={};try{_nm=JSON.parse('{$INPUT.NAME.MAP}');}catch(e){}
+            var _seen={};
+            cards.forEach(function(card){
+            var _enc=encodeURIComponent(card);
+            if(!_nm_all_built){try{var _on_all=api.post(url+'/service/overview/opennode2','xID='+_enc);function _pna(n){var t=n.title||'';var mi=t.match(/\((\d+\.\d+\.\d+\.\d+:\d+)\)/);if(mi){var nm2=t.replace(/\s*\(.*/,'').trim();if(nm2&&mi[1])_nm_all[mi[1]]=nm2;}if(n.children&&Array.isArray(n.children))n.children.forEach(_pna);}JSON.parse(_on_all).forEach(_pna);if(Object.keys(_nm_all).length===0){try{var _ar2=api.post(url+'/status/alarm/get_rows','table_id=tblioalarms&paging_info_tblioalarms='+encodeURIComponent('{"start_row":0,"rows_to_show":100}'));var _xm2=(_ar2||'').match(/s_xID=([^&'"]+)/);if(_xm2){var _xi2=decodeURIComponent(_xm2[1]);var _ont2=api.post(url+'/service/overview/opennode2','xID='+encodeURIComponent(_xi2));var _nres2=JSON.parse(_ont2);_nres2.forEach(function(n){_pna(n);if(n.children&&Array.isArray(n.children))n.children.forEach(_pna);});}}catch(e){}}_nm_all_built=true;try{api.get(url+'/bitrates/input/refresh?s_xID='+_enc+'&filter=TS');var _rts=api.post(url+'/bitrates/input/get_rows?s_xID='+_enc+'&filter=TS','table_id=bitrates_ts_input_table&paging_info_bitrates_ts_input_table='+encodeURIComponent('{"start_row":0,"rows_to_show":500}'));if(_rts){_t(_rts,'tbl_data_bitrates_ts_input_table').forEach(function(tr){var tv=tr.values||[];var tip=(tv[2]||'').trim(),tpt=(tv[3]||'').trim();var tn=(tv[6]||tv[8]||tv[5]||tv[1]||'').trim();if(tn&&tip&&tip!=='-'&&tpt&&!_nm_all[tip+':'+tpt])_nm_all[tip+':'+tpt]=tn;});}}catch(e){}try{var _rsi2=api.post(url+'/status/input/get_rows?s_xID='+_enc+'&filter=TS','table_id=input_table&paging_info_input_table='+encodeURIComponent('{"start_row":0,"rows_to_show":500}'));if(_rsi2){_t(_rsi2,'tbl_data_input_table').forEach(function(row){var dv=row.values||[];for(var ci=0;ci<dv.length;ci++){var cv=String(dv[ci]||'').replace(/<[^>]*>/g,'').trim();var mi2=cv.match(/(\d+\.\d+\.\d+\.\d+:\d+)/);if(mi2&&!_nm_all[mi2[1]]){var sn2=cv.replace(/\s*\(.*$/,'').trim();if(sn2)_nm_all[mi2[1]]=sn2;}}});}}catch(e){}}catch(e){}}
+            api.get(url+'/bitrates/input/refresh?s_xID='+_enc+'&filter=Service');
+            var _resp=api.post(url+'/bitrates/input/get_rows?s_xID='+_enc+'&filter=Service','table_id=bitrates_serv_input_table&paging_info_bitrates_serv_input_table='+encodeURIComponent('{"start_row":0,"rows_to_show":500}'));
+            if(!_resp)return;
+            _t(_resp,'tbl_data_bitrates_serv_input_table').forEach(function(row){
+            var vals=row.values||[],name=(vals[8]||'').trim(),sid=(vals[7]||'').trim(),ip=(vals[2]||'').trim(),port=(vals[3]||'').trim();
+            var bps=Math.round((parseFloat((vals[9]||'0').trim())||0)*1e6);
+            if(!name)return;
+            if(/^Program\s+\d+$/i.test(name)){if(_asm[sid])name=_asm[sid];else{var mk2=ip+':'+port+':'+sid;if(_nm[mk2])name=_nm[mk2];}}
+            if(_nm[name])name=_nm[name];
+            var uk=name+'|'+ip+':'+port;if(_seen[uk])return;_seen[uk]=true;
+            var zk=uk.replace(/[^a-zA-Z0-9._-]/g,'_');
+            var src=(ip==='-'||ip==='')?('port:'+port):(ip+':'+port);
+            R_ib.push({key:zk,name:name,ip:ip,port:port,src:src,bps:bps,card:card});
+            });
+            });
+            var _outBE={},_outBP={},_outBB={};
+            if(_oc){try{
+            api.get(url+'/bitrates/output/refresh?s_xID='+encodeURIComponent(_oc)+'&filter=Service');
+            var _outR=api.post(url+'/bitrates/output/get_rows?s_xID='+encodeURIComponent(_oc)+'&filter=Service','table_id=bitrates_serv_output_table&paging_info_bitrates_serv_output_table='+encodeURIComponent('{"start_row":0,"rows_to_show":500}'));
+            if(_outR){_t(_outR,'tbl_data_bitrates_serv_output_table').forEach(function(row){var vals=row.values||[],rn=(vals[10]||'').trim(),cm=parseFloat((vals[11]||'0').trim());var _pout=rn.match(/\(:(\d+)/);if(_pout){var _nout=rn.indexOf(' (')>=0?rn.substring(0,rn.indexOf(' (')).trim():rn;if(_nout)_nm_all[':'+_pout[1]]=_nout;}if(!rn||isNaN(cm))return;if(/ @ \d+ kbps\)/.test(rn))return;var ck=Math.round(cm*1e3);_outBE[rn]=(_outBE[rn]||0)+ck;var sp2=rn.indexOf(' (');if(sp2>=0){var pfx=rn.substring(0,sp2);_outBP[pfx]=(_outBP[pfx]||0)+ck;}var bn=rn.replace(/ SRT(#\d+)?$/,'').trim();if(bn&&bn!==rn)_outBB[bn]=(_outBB[bn]||0)+ck;});}
+            }catch(e){}}
+            var _ipm={};try{_ipm=JSON.parse('{$INPUT.PROC.NAME.MAP}');}catch(e){}
+            function _ns(s){return s.toLowerCase().replace(/[^a-z0-9]/g,'');}
+            function _gp(n){
+            if(n in _ipm){var mapped=_ipm[n];if(mapped==='')return -1;if(mapped in _pbr)return _pbr[mapped];}
+            if(n in _pbr)return _pbr[n];
+            var stripped=n.replace(/ SRT$/i,'').trim();if(stripped!==n&&stripped in _pbr)return _pbr[stripped];
+            var ns2=n.replace(/\s+/g,'');for(var k in _pbr){if(k.replace(/\s+/g,'')===ns2)return _pbr[k];}
+            var normN=_ns(n),best=0.6,bk=null,bkl=999;
+            for(var pk in _pbr){var normK=_ns(pk);var sh=Math.min(normN.length,normK.length);if(sh<3)continue;var i=0;while(i<sh&&normN[i]===normK[i])i++;var sc=i/sh;if(sc>best||(sc===best&&normK.length<bkl)){best=sc;bk=pk;bkl=normK.length;}}
+            if(bk!==null)return _pbr[bk];return -1;
+            }
+            R_ib.forEach(function(inp){var n=inp.name;var ok=n in _outBE?_outBE[n]:(n in _outBP?_outBP[n]:(n in _outBB?_outBB[n]:-1));inp.out_kbps=ok;inp.proc_kbps=_gp(n);});
+            if(Object.keys(_nm).length>0){Object.keys(_nm_all).forEach(function(addr){if(_nm[_nm_all[addr]])_nm_all[addr]=_nm[_nm_all[addr]];});}
+            }catch(e){R_ib=[];}R_ib.forEach(function(inp){if(inp.port&&inp.name){var _ra=(inp.ip&&inp.ip!=='-')?inp.ip+':'+inp.port:':'+inp.port;if(!_nm_all[_ra])_nm_all[_ra]=inp.name;}});
+            var R_p5=[];
+            try{var _p5r=api.post(url+'/service/overview/opennode2','xID='+encodeURIComponent('{$VDCM.OUTPUT.CARD}'));var _p5d=JSON.parse(_p5r);(function(){var _q=_p5d.slice();while(_q.length>0){var _n=_q.shift();var t=_n.title||'';var _mi=t.match(/(\d+\.\d+\.\d+\.\d+:\d+)/);if(_mi){var _nm2=t.replace(/\s*\(.*/,'').trim();if(_nm2&&_mi[1]&&!_nm_all[_mi[1]])_nm_all[_mi[1]]=_nm2;}var _mt=t.match(/TS\s+ID:\d+\(:(\d+)\)/);if(_mt){var _nmt=t.replace(/\s*\(.*/,'').trim();if(_nmt&&_mt[1]&&!_nm_all[':'+_mt[1]])_nm_all[':'+_mt[1]]=_nmt;}if(_n.children&&Array.isArray(_n.children))_q=_q.concat(_n.children);}})();_p5d.forEach(function(item){var isS=item.nodetype==='TS_S'||item.nodetype==='TS_S_P';if(!isS)return;var bm=(item.tooltip||'').match(/cur:\s*([\d.]+)/);var bps=bm?Math.round(parseFloat(bm[1])*1e6):0;var sp3=(item.title||'').indexOf(' (');var name=sp3>=0?item.title.substring(0,sp3):(item.title||'unknown');var on=(item.title||'').indexOf(' ON ')>=0?1:0;R_p5.push({name:name,bps:bps,on:on});});}catch(e){R_p5=[];}
+            if(Object.keys(_nm).length===0){try{var _on3=api.post(url+'/service/overview/opennode2','xID='+encodeURIComponent(procNode));JSON.parse(_on3).forEach(function(n){function _pn3(x){var t=x.title||'';var mi=t.match(/\((\d+\.\d+\.\d+\.\d+:\d+)\)/);if(mi){var nm2=t.replace(/\s*\(.*/,'').trim();if(nm2&&mi[1])_nm[mi[1]]=nm2;}var mp=t.match(/\((?:RTP|UDP|RTMP)?\)\(:([0-9]+)\)/);if(mp){var nm3=t.replace(/\s*\(.*/,'').trim();if(nm3&&mp[1])_nm[':'+mp[1]]=nm3;}}_pn3(n);if(n.children&&Array.isArray(n.children))n.children.forEach(_pn3);});}catch(e3){}}try{var _on3b=api.post(url+'/service/overview/opennode2','xID='+encodeURIComponent(procNode));JSON.parse(_on3b).forEach(function(n){function _pn3b(x){var t=x.title||'';var mt=t.match(/TS\s+ID:\d+\(:(\d+)\)/);if(mt){var nm_t=t.replace(/\s*\(.*/,'').trim();if(nm_t&&mt[1]&&!_nm_all[':'+mt[1]])_nm_all[':'+mt[1]]=nm_t;}var mp2=t.match(/\((?:RTP|UDP|RTMP)\)\(:(\d+)\)/);if(mp2){var nm_r2=t.replace(/\s*\(.*/,'').trim();if(nm_r2&&mp2[1]&&!_nm_all[':'+mp2[1]])_nm_all[':'+mp2[1]]=nm_r2;}}_pn3b(n);if(n.children&&Array.isArray(n.children))n.children.forEach(_pn3b);});}catch(e4){}if(Object.keys(_nm).length>0){Object.keys(_nm_all).forEach(function(addr){if(_nm[_nm_all[addr]])_nm_all[addr]=_nm[_nm_all[addr]];});}try{return JSON.stringify({device_status:R_dev,alarms_detail:R_alm,alarms_json:(function(){var _ca2={};Object.keys(_nm_all).forEach(function(addr){var name=_nm_all[addr];if(!name)return;var ch=name+'('+addr+')';var id=addr.replace(/[^a-zA-Z0-9.]/g,'_').replace(/_+/g,'_').replace(/^_|_$/g,'');_ca2[id]={id:id,ch:ch,alarm:''};});Object.keys(_ca_alm).forEach(function(k){var e=_ca_alm[k],ch=e.ch,alarm=e.alarm,rch=ch;var pm=ch.match(/^:(\d+)$/);if(pm&&_nm_all[':'+pm[1]])rch=_nm_all[':'+pm[1]]+'('+ch+')';var im=ch.match(/^(\d+\.\d+\.\d+\.\d+:\d+)$/);if(im&&_nm_all[im[1]])rch=_nm_all[im[1]]+'('+ch+')';var _m1=rch.match(/\((\d+\.\d+\.\d+\.\d+:\d+)\)$/);var _m2=!_m1&&rch.match(/\(:(\d+)\)$/);var id2=_m1?_m1[1].replace(/[^a-zA-Z0-9.]/g,'_').replace(/_+/g,'_').replace(/^_|_$/g,''):(_m2?_m2[1]:rch.replace(/\(/g,'_').replace(/\)/g,'').replace(/[^a-zA-Z0-9.]/g,'_').replace(/_+/g,'_').replace(/^_|_$/g,''));if(!_ca2[id2]||alarm)_ca2[id2]={id:id2,ch:rch,alarm:alarm};});return Object.keys(_ca2).map(function(k){return _ca2[k];});}()),last_xid:_last_xid,packager_alarms:R_pkg,processing_alarms:R_proc,services_bitrates:R_svc.services,input_bitrates:R_ib,port5_bitrates:R_p5,proc_bps:R_svc.proc_bps,nm_map:JSON.stringify((function(){var _m={};function _hh(s){return String(s||"").replace(/<[^>]+>/g,"").replace(/^Service0?\d+\s*\(([^)]+)\)$/,"$1").trim();}Object.keys(_nm_all).forEach(function(k){var v=_hh(_nm_all[k]);if(v)_m[k]=v;});R_ib.forEach(function(r){if(r.port&&r.name){var _rk=(r.ip&&r.ip!=='-')?r.ip+':'+r.port:':'+r.port;var _nn=_hh(r.name);if(_nn)_m[_rk]=_nn;}});return _m;}()))});
+            }catch(e){return JSON.stringify({device_status:R_dev,alarms_detail:'ERROR: '+String(e),packager_alarms:'ERROR: '+String(e),processing_alarms:'ERROR: '+String(e),services_bitrates:[],input_bitrates:[],port5_bitrates:[],proc_bps:0,nm_map:{}});}finally{_logout();}
+          description: 'Master item: one login → fetch all monitoring data → logout. Returns combined JSON for all dependent items.'
+          timeout: 90s
+          triggers:
+            - uuid: 8f2dbb6e7caf470cb0cf4eebdd02bae8
+              expression: 'nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.data,15m)=1'
+              recovery_mode: RECOVERY_EXPRESSION
+              recovery_expression: 'nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.data,6m)=0'
+              name: 'vDCM monitoring unavailable (no data > 6 min)'
+              priority: HIGH
+              description: 'vdcm.data master item has not been updated for 6+ minutes. All dependent monitoring items are stale. Check Zabbix server connectivity and vDCM device availability.'
+              manual_close: 'YES'
+        - uuid: 5b6cdcbf4e2c438fa98d2e3f32863969
+          name: 'vDCM device state'
+          type: DEPENDENT
+          key: vdcm.device.state
+          history: 90d
+          value_type: TEXT
+          description: 'vDCM device operational role string (e.g. "Active - Role: Standalone"). Sourced from /load_alarm_footer device_state element. Informational only.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.device_state
+          master_item:
+            key: vdcm.device.status
+        - uuid: d74febf23647445e88763b1c0f34d7d9
+          name: 'vDCM device health status'
+          type: DEPENDENT
+          key: vdcm.device.status
+          history: 7d
+          value_type: TEXT
+          description: 'Logs into vDCM and queries GET /load_alarm_footer for device health. Returns JSON: {"alarm_count":0,"device_state":"Active - Role: Standalone", "vdcm_state":"Active"}. alarm_count = number of active alarms (0 = no alarms). device_state = operational role string. vdcm_state = "Active" when device is healthy. alarm_count of -1 means the field was not found in the response.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.device_status
+          master_item:
+            key: vdcm.data
+        - uuid: fcd1b48d233e43e590116dc215e0337d
+          name: 'vDCM state'
+          type: DEPENDENT
+          key: vdcm.device.vdcm_state
+          history: 90d
+          value_type: TEXT
+          description: 'vDCM operational state string (e.g. "Active"). Sourced from /load_alarm_footer vdcm_state element. Expected value: "Active" during normal operation.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.vdcm_state
+          master_item:
+            key: vdcm.device.status
+          triggers:
+            - uuid: 297193956d414dad87ed88cdebd2f4b2
+              expression: 'last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.device.vdcm_state)<>"Active" and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.device.vdcm_state)<>"unknown"'
+              name: 'vDCM: state is not Active (current: {ITEM.LASTVALUE})'
+              priority: HIGH
+              description: 'The vDCM state is not "Active" (current: {ITEM.LASTVALUE}). Device may be in fault, standby, or restarting state. Log in to {$VDCM.URL} to investigate. Note: "unknown" (HTTP parse failure) is excluded to prevent false alarms.'
+        - uuid: b2c3d4e5f6a7489490b2c3d4e5f6a7b8
+          name: 'vDCM all input stream bitrates (HTTP API)'
+          type: DEPENDENT
+          key: vdcm.input.bitrates
+          history: 7d
+          value_type: TEXT
+          description: 'Queries real-time INPUT source stream bitrates from all cards in {$VDCM.INPUT.CARDS}. Uses /bitrates/input/refresh (triggers server-side data collection) then /bitrates/input/get_rows to fetch the data table. Returns JSON array: [{"key":"...","name":"...","ip":"...","port":"...","bps":...},...]. Each entry = one unique input stream (IP:port combination). This is the master item for input stream LLD discovery and per-stream bitrate items. If empty: check {$VDCM.INPUT.CARDS}, verify cards have active input streams. If login fails: check {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}. Verified on litv_tran2 (211.21.3.210): T_I:1:4 = 14 streams, T_I:1:65532 = 11 streams.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.input_bitrates
+          master_item:
+            key: vdcm.data
+          triggers:
+            - uuid: c3d4e5f6a7b8490591c3d4e5f6a7b8c9
+              expression: 'nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.input.bitrates,15m)=1'
+              name: 'vDCM: no input bitrate data for 5+ minutes (check {$VDCM.INPUT.CARDS})'
+              priority: HIGH
+              description: 'No input bitrate data collected for 5+ minutes. Possible causes: 1. {$VDCM.INPUT.CARDS} macro has wrong card IDs for this device. 2. vDCM login failed - check {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}. 3. Device unreachable (network / firewall issue). All input stream monitors are effectively blind until this clears. Find correct card IDs: open {$VDCM.URL}/bitrates/input in DevTools, check s_xID in /bitrates/input/get_rows XHR call.'
+        - uuid: 3c4d5e6f7a8b4901a43c4d5e6f7a8b9c
+          name: 'vDCM stopped output services count'
+          type: DEPENDENT
+          key: vdcm.output.stopped_count
+          history: 90d
+          description: 'Number of OUTPUT encoding services currently reporting bitrate = 0. Value > 0 means at least one encoding service has stopped. Used as a guard condition: INPUT bitrate alerts (low/critically-low) only fire when this counter is > 0, ensuring alerts reflect actual output impact. If all outputs are healthy, INPUT fluctuations are suppressed.'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var data = JSON.parse(value);
+                  return String(data.filter(function(s) { return s.bps === 0; }).length);
+          master_item:
+            key: vdcm.services.bitrates
+        - uuid: 37644991b7ed4a62a86e278b2d49dcb6
+          name: 'vDCM output packager alarm details'
+          type: DEPENDENT
+          key: vdcm.packager.alarms
+          history: 90d
+          value_type: TEXT
+          description: |
+            Extracts only output-packager/detail alarms from the master collector.
+            This catches real device faults such as Output Packager / Out-Pkg detail rows that are not
+            generic alarm_count noise and should not be silently discarded.
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.packager_alarms
+          master_item:
+            key: vdcm.data
+          triggers:
+            - uuid: 2d0d6f7ec7d74d5e99a6c2f72e9d3e5c
+              expression: 'last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.packager.alarms)<>"OK" and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.packager.alarms)<>"" and find(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.packager.alarms,,"like","ERROR:")=0'
+              recovery_mode: RECOVERY_EXPRESSION
+              recovery_expression: 'last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.packager.alarms)="OK" or last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.packager.alarms)="" or find(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.packager.alarms,,"like","ERROR:")=1'
+              name: 'vDCM: output packager fault — {ITEM.LASTVALUE}'
+              priority: HIGH
+              description: 'Real Output Packager / Out-Pkg detail fault detected from the vDCM status/detail API. This is the alarm class that corresponds to Packager-level service faults and should be treated as a real issue rather than generic noise.'
+              manual_close: 'YES'
+        - uuid: b3c4d5e6f7a84b2c9ab3c4d5e6f7a8b9
+          name: 'vDCM Port 5 SRT output stream bitrates (HTTP API)'
+          type: DEPENDENT
+          key: vdcm.port5.bitrates
+          history: 7d
+          value_type: TEXT
+          description: 'Queries Port 5 ({$VDCM.OUTPUT.CARD}) SRT output stream bitrates via opennode2. Filters TS_S type nodes, extracts bitrate from tooltip "cur: X.X" field. Returns JSON array: [{"name":"TVBSN SRT","bps":9800000}, ...]. Stream names are extracted as the prefix before the first " (" in the title (e.g. "TVBSN SRT (1) ON ID:1..." → "TVBSN SRT"). This is the master item for Port 5 SRT LLD discovery. Verified streams on litv_tran1/tran2: TVBSN SRT, EBCNews SRT, EBCF, FTV-HD SRT.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.port5_bitrates
+          master_item:
+            key: vdcm.data
+          triggers:
+            - uuid: c4d5e6f7a8b94c3dabc4d5e6f7a8b9ca
+              expression: 'nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.bitrates,15m)=1'
+              name: 'vDCM: no Port 5 SRT data for 5+ minutes'
+              priority: HIGH
+              description: 'No Port 5 SRT output data for 5+ minutes. Port 5 ({$VDCM.OUTPUT.CARD}) may be unreachable or all SRT streams have stopped.'
+        - uuid: d5ac44b6da5541baa07e7650116c77a1
+          name: 'vDCM total processing bitrate'
+          type: DEPENDENT
+          key: vdcm.proc.bitrate
+          history: 7d
+          units: bps
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.proc_bps
+          master_item:
+            key: vdcm.data
+          triggers:
+            - uuid: 69e15598a2814eed9ab5825454195226
+              expression: 'min(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.proc.bitrate,3m)<60000000 and min(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.proc.bitrate,3m)>0'
+              name: 'vDCM: total output bitrate dropped below threshold ({ITEM.LASTVALUE})'
+              priority: HIGH
+              manual_close: 'YES'
+        - uuid: e1f2a3b4c5d6470891e1f2a3b4c5d6e7
+          name: 'vDCM processing alarms (HTTP API)'
+          type: DEPENDENT
+          key: vdcm.processing.alarms
+          history: 90d
+          value_type: TEXT
+          description: 'Queries processing-layer alarms from all input cards in {$VDCM.PROC.CARDS} via POST /status/processing/get_rows (Web UI API). Returns "OK" when no processing alarms. Returns comma-separated list of affected channels with alarm type when faults exist, e.g. "DayStarMain: TS Sync Loss, EHS2RTMP: TS Stream Loss". Auth: POST /login_handler?came_from=/ → session cookie. Processing alarms = real encoding faults. Only PTS Discontinuity (VBR RTMP quality noise) is suppressed. TS Stream Loss and UDP Stream Loss on NAMED channels are treated as real faults (empty slot alarms are already filtered by service-name check). Note: REST API (/api/v2/AlarmHistory) returns 204 on these units (not enabled).'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.processing_alarms
+          master_item:
+            key: vdcm.data
+          triggers:
+            - uuid: f2a3b4c5d6e7481982f2a3b4c5d6e7f8
+              expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.processing.alarms,5m,"ne","OK")>=2'
+              name: 'vDCM: processing fault — {ITEM.LASTVALUE}'
+              priority: HIGH
+              description: 'Processing-layer fault(s) detected on the vDCM device. Affected channels shown in {ITEM.LASTVALUE}, e.g. "GOODTV2: Service Loss, Video Input Loss". With delay=2m, requires 2 consecutive non-OK polls (~4 min sustained) to fire. Source: POST /status/processing/get_rows per card in {$VDCM.PROC.CARDS}, then /status/detail/get_rows per alarmed service. Noise suppressed: PTS Discontinuity only (VBR RTMP). TS Stream Loss / UDP Stream Loss on named channels = real RTMP source failure and WILL fire this trigger. Empty slot alarms are filtered by service-name check (no name). Investigate at {$VDCM.URL} → Status > Processing.'
+        - uuid: a1b2c3d4e5f6478390a1b2c3d4e5f648
+          name: 'vDCM processing service health heartbeat (HTTP API)'
+          type: DEPENDENT
+          key: vdcm.services.bitrates
+          history: 7d
+          value_type: TEXT
+          description: 'Logs into vDCM web UI via POST /login_handler and queries all S-type encoding services under {$VDCM.PROC.NODE} via POST /service/overview/opennode2. Returns JSON array: [{"name":"SvcName","bps":200000,"title":"Full Title"},...]. NOTE: The "bps" value is vMFP internal keepalive (~0.2~0.4 Mbps), NOT real output bitrate. It drops to 0 only when the vMFP service crashes. Used as service health indicator. This is the master item for per-service heartbeat LLD discovery. If empty response: check {$VDCM.PROC.NODE} value. If login fails: check {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.services_bitrates
+          master_item:
+            key: vdcm.data
+          triggers:
+            - uuid: a9b8c7d6e5f4490382a9b8c7d6e5f640
+              expression: 'nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.services.bitrates,15m)=1'
+              name: 'vDCM: no bitrate data for 5+ minutes (device unreachable or script failure)'
+              priority: HIGH
+              description: 'No bitrate data collected for 5+ minutes. Possible causes: 1. vDCM device unreachable (network / firewall issue). 2. Login failed - check {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}. 3. Wrong {$VDCM.PROC.NODE} - check Zabbix item log for script error. All per-service bitrate monitors are effectively blind until this clears.'
+        - uuid: f0e1d2c3b4a5490182f0e1d2c3b4a591
+          name: 'vDCM TS IP-to-channel map (for {$SNMP.IP.MAP})'
+          type: DEPENDENT
+          key: vdcm.snmp.ip.map
+          history: 7d
+          value_type: TEXT
+          description: |
+            Automatically extracts the IP:port → channel name map from vdcm.data nm_map field.
+            Outputs a JSON string ready to paste into the {$SNMP.IP.MAP} host macro, which is used
+            by the SNMP trap preprocessing to display channel names in alarm notifications.
+            Updated at the same interval as vdcm.data (every 30s).
+            Usage:
+              Method A (manual): Copy this item value → paste into Host → Macros → {$SNMP.IP.MAP}
+              Method B (auto):   Run vdcm_update_ip_map.py as a cron job to update the macro automatically
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  // Extract nm_map from vdcm.data and output as {$SNMP.IP.MAP}-ready JSON.
+                  // Filters to only include entries with an IP:port key (colon present).
+                  try {
+                    var d = JSON.parse(value);
+                    var nm = JSON.parse(d.nm_map || '{}');
+                    var out = {};
+                    Object.keys(nm).forEach(function(k) {
+                      if (nm[k] && k.indexOf(':') >= 0) out[k] = nm[k];
+                    });
+                    return JSON.stringify(out, null, 0);
+                  } catch(e) { return '{}'; }
+          master_item:
+            key: vdcm.data
+      discovery_rules:
+        - uuid: f61fed4c462f40eaa752383d6b55920c
+          name: 'vDCM SNMP trap P1 (High) discovery'
+          type: DEPENDENT
+          key: snmp.channel.p1.discovery
+          description: 'Tier P1: critical faults on any channel — fires on first event (High).'
+          item_prototypes:
+            - uuid: a99855fcb5b44a63b056a60b4f10a0c8
+              name: 'P1 {#CH}: {#FAULT}'
+              type: DEPENDENT
+              key: 'snmptrap.p1[{#CH}|{#FAULT}]'
+              history: 2d
+              value_type: TEXT
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      // Exact match on "<channel>: <fault>" (+ optional " — Cleared") to prevent prefix-substring cross-talk.
+                      // Non-matching values return '' (stored but not counted); DISCARD_VALUE would make never-matched items unsupported and break count().
+                      var v = (value || '').trim();
+                      if (!v) return '';
+                      var expected = ('{#CH}' + ': ' + '{#FAULT}').toLowerCase();
+                      var lower = v.toLowerCase();
+                      if (lower !== expected && lower !== expected + ' — cleared') return '';
+                      return v;
+              master_item:
+                key: 'snmptrap[trapControlMsgTrap]'
+              trigger_prototypes:
+                - uuid: d01c78544e634084b152c91c9a256d7d
+                  expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p1[{#CH}|{#FAULT}],{$SNMP.TRAP.P1_WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p1[{#CH}|{#FAULT}],{$SNMP.TRAP.P1_WINDOW},"like","— Cleared") >= {$SNMP.TRAP.P1_MIN_COUNT:"{#CH}"}'
+                  recovery_mode: RECOVERY_EXPRESSION
+                  recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p1[{#CH}|{#FAULT}],{$SNMP.TRAP.P1_WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p1[{#CH}|{#FAULT}],{$SNMP.TRAP.P1_WINDOW},"like","— Cleared") < {$SNMP.TRAP.P1_MIN_COUNT:"{#CH}"} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p1[{#CH}|{#FAULT}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  name: '{#CH}: {#FAULT}'
+                  priority: DISASTER
+                  manual_close: 'YES'
+                  tags:
+                    - tag: channel
+                      value: '{#CH}'
+                    - tag: fault
+                      value: '{#FAULT}'
+                    - tag: severity
+                      value: disaster
+                    - tag: source
+                      value: vdcm-snmp
+                    - tag: tier
+                      value: P1
+          master_item:
+            key: vdcm.snmp.ip.map
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var m = {}; try { m = JSON.parse(value) || {}; } catch(e) { return '[]'; }
+                  var placeholder = /^(service\d+|program(\s*\d+)?|channel\d+|input\d+|output\d+)$/i;
+                  var faults = [
+                    'Service Loss',
+                    'Service loss at output',
+                    'Video Input Loss',
+                    'Audio Input Loss',
+                    'TS Loss',
+                    'TS Sync Loss',
+                    'Packager Origin Server Not Connected',
+                    'SRT connection loss',
+                    'MFP Processing Overload'
+                  ];
+                  var seen = {}; var out = [];
+                  Object.keys(m).forEach(function(k){
+                    var v = String(m[k]||'').trim();
+                    if (!v || placeholder.test(v)) return;
+                    var key = v.toLowerCase();
+                    if (seen[key]) return; seen[key]=1;
+                    faults.forEach(function(f){ out.push({"{#CH}":v,"{#FAULT}":f}); });
+                  });
+                  return JSON.stringify(out);
+        - uuid: 61b33cfd21a947f0a1d2b0a1ed96a2f7
+          name: 'vDCM SNMP trap P2 (Average) discovery'
+          type: DEPENDENT
+          key: snmp.channel.p2.discovery
+          description: 'Tier P2: sustained faults — fires after {$SNMP.TRAP.P2_MIN_COUNT} events in {$SNMP.TRAP.P2_WINDOW} (Average).'
+          item_prototypes:
+            - uuid: 48a4752bc3e74a7687c0aafb7ef02c7c
+              name: 'P2 {#CH}: {#FAULT}'
+              type: DEPENDENT
+              key: 'snmptrap.p2[{#CH}|{#FAULT}]'
+              history: 2d
+              value_type: TEXT
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      // Exact match; empty return keeps item supported so count() can evaluate on cold items.
+                      var v = (value || '').trim();
+                      if (!v) return '';
+                      var expected = ('{#CH}' + ': ' + '{#FAULT}').toLowerCase();
+                      var lower = v.toLowerCase();
+                      if (lower !== expected && lower !== expected + ' — cleared') return '';
+                      return v;
+              master_item:
+                key: 'snmptrap[trapControlMsgTrap]'
+              trigger_prototypes:
+                - uuid: 24d938a67b844dea90487f94dbc1e7fe
+                  expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p2[{#CH}|{#FAULT}],{$SNMP.TRAP.P2_WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p2[{#CH}|{#FAULT}],{$SNMP.TRAP.P2_WINDOW},"like","— Cleared") >= {$SNMP.TRAP.P2_MIN_COUNT}'
+                  recovery_mode: RECOVERY_EXPRESSION
+                  recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p2[{#CH}|{#FAULT}],{$SNMP.TRAP.P2_WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p2[{#CH}|{#FAULT}],{$SNMP.TRAP.P2_WINDOW},"like","— Cleared") < {$SNMP.TRAP.P2_MIN_COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p2[{#CH}|{#FAULT}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  name: '{#CH}: {#FAULT}'
+                  priority: AVERAGE
+                  manual_close: 'YES'
+                  tags:
+                    - tag: channel
+                      value: '{#CH}'
+                    - tag: fault
+                      value: '{#FAULT}'
+                    - tag: severity
+                      value: average
+                    - tag: source
+                      value: vdcm-snmp
+                    - tag: tier
+                      value: P2
+          master_item:
+            key: vdcm.snmp.ip.map
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var m = {}; try { m = JSON.parse(value) || {}; } catch(e) { return '[]'; }
+                  var placeholder = /^(service\d+|program(\s*\d+)?|channel\d+|input\d+|output\d+)$/i;
+                  var faults = [
+                    'Packager Input Data Loss',
+                    'Packager Input PCR Not Received In Time',
+                    'Packager Input PTS Not Received In Time',
+                    'Packager Input EBP Not Received',
+                    'Packager Video Sync',
+                    'Packager Input Stream Alignment Error',
+                    'Bandwidth Exceeded',
+                    'EBP out of sync',
+                    'SRT Sender Buffer Overflow',
+                    'Threshold Reached for the SRT Lost Packets',
+                    'Source IP address of TS changed',
+                    'Invalid Resolution',
+                    'PAT Error',
+                    'PMT Error',
+                    'PID Error'
+                  ];
+                  var seen = {}; var out = [];
+                  Object.keys(m).forEach(function(k){
+                    var v = String(m[k]||'').trim();
+                    if (!v || placeholder.test(v)) return;
+                    var key = v.toLowerCase();
+                    if (seen[key]) return; seen[key]=1;
+                    faults.forEach(function(f){ out.push({"{#CH}":v,"{#FAULT}":f}); });
+                  });
+                  return JSON.stringify(out);
+        - uuid: b17688be841441e7ab7c02fe04f14497
+          name: 'vDCM SNMP trap P3 (Warning) discovery'
+          type: DEPENDENT
+          key: snmp.channel.p3.discovery
+          description: 'Tier P3: chronic noise — fires after {$SNMP.TRAP.P3_MIN_COUNT} events in {$SNMP.TRAP.P3_WINDOW} (Warning).'
+          item_prototypes:
+            - uuid: a45cdf6af02c47e4bde62d89ba25fb3e
+              name: 'P3 {#CH}: {#FAULT}'
+              type: DEPENDENT
+              key: 'snmptrap.p3[{#CH}|{#FAULT}]'
+              history: 2d
+              value_type: TEXT
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      // Exact match; empty return keeps item supported so count() can evaluate on cold items.
+                      var v = (value || '').trim();
+                      if (!v) return '';
+                      var expected = ('{#CH}' + ': ' + '{#FAULT}').toLowerCase();
+                      var lower = v.toLowerCase();
+                      if (lower !== expected && lower !== expected + ' — cleared') return '';
+                      return v;
+              master_item:
+                key: 'snmptrap[trapControlMsgTrap]'
+              trigger_prototypes:
+                - uuid: 433180323e9745ac8da56c506cbd14bc
+                  expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p3[{#CH}|{#FAULT}],{$SNMP.TRAP.P3_WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p3[{#CH}|{#FAULT}],{$SNMP.TRAP.P3_WINDOW},"like","— Cleared") >= {$SNMP.TRAP.P3_MIN_COUNT}'
+                  recovery_mode: RECOVERY_EXPRESSION
+                  recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p3[{#CH}|{#FAULT}],{$SNMP.TRAP.P3_WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p3[{#CH}|{#FAULT}],{$SNMP.TRAP.P3_WINDOW},"like","— Cleared") < {$SNMP.TRAP.P3_MIN_COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.p3[{#CH}|{#FAULT}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  name: '{#CH}: {#FAULT}'
+                  priority: WARNING
+                  manual_close: 'YES'
+                  tags:
+                    - tag: channel
+                      value: '{#CH}'
+                    - tag: fault
+                      value: '{#FAULT}'
+                    - tag: severity
+                      value: warning
+                    - tag: source
+                      value: vdcm-snmp
+                    - tag: tier
+                      value: P3
+          master_item:
+            key: vdcm.snmp.ip.map
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var m = {}; try { m = JSON.parse(value) || {}; } catch(e) { return '[]'; }
+                  var placeholder = /^(service\d+|program(\s*\d+)?|channel\d+|input\d+|output\d+)$/i;
+                  var faults = [
+                    'PTS Discontinuity',
+                    'CC Error',
+                    'User Selected PCR PID Error',
+                    'No PCR Present',
+                    'UDP Stream Loss',
+                    'Dejitter Buffer Reset',
+                    'Audio PTS Too Far Off',
+                    'RTP Buffer Too Small For Fixed Delay',
+                    'Time Source Unavailable',
+                    'Licensing Warning',
+                    'Audio Processing End-to-End Delay Too Low'
+                  ];
+                  var seen = {}; var out = [];
+                  Object.keys(m).forEach(function(k){
+                    var v = String(m[k]||'').trim();
+                    if (!v || placeholder.test(v)) return;
+                    var key = v.toLowerCase();
+                    if (seen[key]) return; seen[key]=1;
+                    faults.forEach(function(f){ out.push({"{#CH}":v,"{#FAULT}":f}); });
+                  });
+                  return JSON.stringify(out);
+        - uuid: 51fe24d420ee40b8a49a5247bfa8c3a8
+          name: 'vDCM SNMP Packager Input Stream Config Mismatch (3-tier escalation) discovery'
+          type: DEPENDENT
+          key: snmp.channel.pkgcfg.discovery
+          description: 'Dedicated 3-tier escalation for Packager Input Stream Config Mismatch (input stream parameters do not match packager expectations). Synamedia trap msgSeverity=2 Major, not service loss — top tier capped at HIGH (not Disaster). Warning first detect / Average ~30s sustained / High ~5min chronic. Higher severity suppresses lower via dependency.'
+          item_prototypes:
+            - uuid: 62f04cd7e9944d209f4aac82f9ca37bb
+              name: 'Packager Input Stream Config Mismatch: {#CH}'
+              type: DEPENDENT
+              key: 'snmptrap.pkgcfg[{#CH}]'
+              history: 2d
+              value_type: TEXT
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var v = (value || '').trim();
+                      if (!v) return '';
+                      var expected = ('{#CH}' + ': Packager Input Stream Config Mismatch').toLowerCase();
+                      var lower = v.toLowerCase();
+                      if (lower !== expected && lower !== expected + ' — cleared') return '';
+                      return v;
+              master_item:
+                key: 'snmptrap[trapControlMsgTrap]'
+              trigger_prototypes:
+                - uuid: 63091388f5f64f0bb8628976910e827f
+                  expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.AVG.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.AVG.WINDOW},"like","— Cleared") >= {$SNMP.TRAP.PKGCFG.AVG.COUNT}'
+                  recovery_mode: RECOVERY_EXPRESSION
+                  recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.AVG.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.AVG.WINDOW},"like","— Cleared") < {$SNMP.TRAP.PKGCFG.AVG.COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  name: '{#CH}: Packager Input Stream Config Mismatch (30s sustained, investigate)'
+                  priority: AVERAGE
+                  manual_close: 'YES'
+                  dependencies:
+                    - name: '{#CH}: Packager Input Stream Config Mismatch (chronic 5min, engineering)'
+                      expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.HIGH.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.HIGH.WINDOW},"like","— Cleared") >= {$SNMP.TRAP.PKGCFG.HIGH.COUNT}'
+                      recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.HIGH.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.HIGH.WINDOW},"like","— Cleared") < {$SNMP.TRAP.PKGCFG.HIGH.COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  tags:
+                    - tag: channel
+                      value: '{#CH}'
+                    - tag: fault
+                      value: 'Packager Input Stream Config Mismatch'
+                    - tag: level
+                      value: average
+                    - tag: source
+                      value: vdcm-snmp
+                - uuid: 92d9be09559b466989f52d3f5d1802c8
+                  expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.HIGH.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.HIGH.WINDOW},"like","— Cleared") >= {$SNMP.TRAP.PKGCFG.HIGH.COUNT}'
+                  recovery_mode: RECOVERY_EXPRESSION
+                  recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.HIGH.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.HIGH.WINDOW},"like","— Cleared") < {$SNMP.TRAP.PKGCFG.HIGH.COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  name: '{#CH}: Packager Input Stream Config Mismatch (chronic 5min, engineering)'
+                  priority: HIGH
+                  manual_close: 'YES'
+                  tags:
+                    - tag: channel
+                      value: '{#CH}'
+                    - tag: fault
+                      value: 'Packager Input Stream Config Mismatch'
+                    - tag: level
+                      value: high
+                    - tag: source
+                      value: vdcm-snmp
+                - uuid: 136415e085624a8880b696b522b91533
+                  expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.WARN.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.WARN.WINDOW},"like","— Cleared") >= {$SNMP.TRAP.PKGCFG.WARN.COUNT}'
+                  recovery_mode: RECOVERY_EXPRESSION
+                  recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.WARN.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.WARN.WINDOW},"like","— Cleared") < {$SNMP.TRAP.PKGCFG.WARN.COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  name: '{#CH}: Packager Input Stream Config Mismatch (first detect, watching)'
+                  priority: WARNING
+                  manual_close: 'YES'
+                  dependencies:
+                    - name: '{#CH}: Packager Input Stream Config Mismatch (30s sustained, investigate)'
+                      expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.AVG.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.AVG.WINDOW},"like","— Cleared") >= {$SNMP.TRAP.PKGCFG.AVG.COUNT}'
+                      recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.AVG.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.PKGCFG.AVG.WINDOW},"like","— Cleared") < {$SNMP.TRAP.PKGCFG.AVG.COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgcfg[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  tags:
+                    - tag: channel
+                      value: '{#CH}'
+                    - tag: fault
+                      value: 'Packager Input Stream Config Mismatch'
+                    - tag: level
+                      value: warning
+                    - tag: source
+                      value: vdcm-snmp
+          master_item:
+            key: vdcm.snmp.ip.map
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var m = {}; try { m = JSON.parse(value) || {}; } catch(e) { return '[]'; }
+                  var placeholder = /^(service\d+|program(\s*\d+)?|channel\d+|input\d+|output\d+)$/i;
+                  var seen = {}; var out = [];
+                  Object.keys(m).forEach(function(k){
+                    var v = String(m[k]||'').trim();
+                    if (!v || placeholder.test(v)) return;
+                    var key = v.toLowerCase();
+                    if (seen[key]) return; seen[key]=1;
+                    out.push({"{#CH}":v});
+                  });
+                  return JSON.stringify(out);
+        - uuid: 3fdeeab51fb148da9420e774fd30d2cc
+          name: 'vDCM SNMP Packager Output Partitioning Failure (3-tier escalation) discovery'
+          type: DEPENDENT
+          key: snmp.channel.pkgpart.discovery
+          description: 'Dedicated 3-tier escalation for Packager Output Partitioning Failure (HLS segment timing). Synamedia trap msgSeverity=2 Major, not service loss — top tier capped at HIGH (not Disaster). Warning first detect / Average ~30s sustained / High ~5min chronic. Higher severity suppresses lower via dependency.'
+          item_prototypes:
+            - uuid: 0d3f89a84f21485d97e452ba576fd494
+              name: 'Packager Output Partitioning Failure: {#CH}'
+              type: DEPENDENT
+              key: 'snmptrap.pkgpart[{#CH}]'
+              history: 2d
+              value_type: TEXT
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var v = (value || '').trim();
+                      if (!v) return '';
+                      var expected = ('{#CH}' + ': Packager Output Partitioning Failure').toLowerCase();
+                      var lower = v.toLowerCase();
+                      if (lower !== expected && lower !== expected + ' — cleared') return '';
+                      return v;
+              master_item:
+                key: 'snmptrap[trapControlMsgTrap]'
+              trigger_prototypes:
+                - uuid: 741e49e78a024a1a9d88ef385f321cc5
+                  expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.AVG.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.AVG.WINDOW},"like","— Cleared") >= {$SNMP.TRAP.PKGPART.AVG.COUNT}'
+                  recovery_mode: RECOVERY_EXPRESSION
+                  recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.AVG.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.AVG.WINDOW},"like","— Cleared") < {$SNMP.TRAP.PKGPART.AVG.COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  name: '{#CH}: Packager Output Partitioning Failure (30s sustained, investigate)'
+                  priority: AVERAGE
+                  manual_close: 'YES'
+                  dependencies:
+                    - name: '{#CH}: Packager Output Partitioning Failure (chronic 5min, engineering)'
+                      expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.HIGH.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.HIGH.WINDOW},"like","— Cleared") >= {$SNMP.TRAP.PKGPART.HIGH.COUNT}'
+                      recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.HIGH.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.HIGH.WINDOW},"like","— Cleared") < {$SNMP.TRAP.PKGPART.HIGH.COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  tags:
+                    - tag: channel
+                      value: '{#CH}'
+                    - tag: fault
+                      value: 'Packager Output Partitioning Failure'
+                    - tag: level
+                      value: average
+                    - tag: source
+                      value: vdcm-snmp
+                - uuid: c3ba2df9b7984164845b6cc56bda7220
+                  expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.HIGH.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.HIGH.WINDOW},"like","— Cleared") >= {$SNMP.TRAP.PKGPART.HIGH.COUNT}'
+                  recovery_mode: RECOVERY_EXPRESSION
+                  recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.HIGH.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.HIGH.WINDOW},"like","— Cleared") < {$SNMP.TRAP.PKGPART.HIGH.COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  name: '{#CH}: Packager Output Partitioning Failure (chronic 5min, engineering)'
+                  priority: HIGH
+                  manual_close: 'YES'
+                  tags:
+                    - tag: channel
+                      value: '{#CH}'
+                    - tag: fault
+                      value: 'Packager Output Partitioning Failure'
+                    - tag: level
+                      value: high
+                    - tag: source
+                      value: vdcm-snmp
+                - uuid: 56f26b81902b437793198cd8ac373c8a
+                  expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.WARN.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.WARN.WINDOW},"like","— Cleared") >= {$SNMP.TRAP.PKGPART.WARN.COUNT}'
+                  recovery_mode: RECOVERY_EXPRESSION
+                  recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.WARN.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.WARN.WINDOW},"like","— Cleared") < {$SNMP.TRAP.PKGPART.WARN.COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  name: '{#CH}: Packager Output Partitioning Failure (first detect, watching)'
+                  priority: WARNING
+                  manual_close: 'YES'
+                  dependencies:
+                    - name: '{#CH}: Packager Output Partitioning Failure (30s sustained, investigate)'
+                      expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.AVG.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.AVG.WINDOW},"like","— Cleared") >= {$SNMP.TRAP.PKGPART.AVG.COUNT}'
+                      recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.AVG.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.PKGPART.AVG.WINDOW},"like","— Cleared") < {$SNMP.TRAP.PKGPART.AVG.COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.pkgpart[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  tags:
+                    - tag: channel
+                      value: '{#CH}'
+                    - tag: fault
+                      value: 'Packager Output Partitioning Failure'
+                    - tag: level
+                      value: warning
+                    - tag: source
+                      value: vdcm-snmp
+          master_item:
+            key: vdcm.snmp.ip.map
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var m = {}; try { m = JSON.parse(value) || {}; } catch(e) { return '[]'; }
+                  var placeholder = /^(service\d+|program(\s*\d+)?|channel\d+|input\d+|output\d+)$/i;
+                  var seen = {}; var out = [];
+                  Object.keys(m).forEach(function(k){
+                    var v = String(m[k]||'').trim();
+                    if (!v || placeholder.test(v)) return;
+                    var key = v.toLowerCase();
+                    if (seen[key]) return; seen[key]=1;
+                    out.push({"{#CH}":v});
+                  });
+                  return JSON.stringify(out);
+        - uuid: 2761d862202e4896b411683a2d1698dd
+          name: 'vDCM SNMP TS Out Loss (3-tier escalation) discovery'
+          type: DEPENDENT
+          key: snmp.channel.tsout.discovery
+          description: 'Dedicated 3-tier escalation for TS Out Loss: Warning first detect / High ~30s sustained / Disaster ~5min sustained. Higher severity suppresses lower via dependency.'
+          item_prototypes:
+            - uuid: 26ca83f3d5b84b7a93071c0594f52eeb
+              name: 'TS Out Loss: {#CH}'
+              type: DEPENDENT
+              key: 'snmptrap.tsout[{#CH}]'
+              history: 2d
+              value_type: TEXT
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var v = (value || '').trim();
+                      if (!v) return '';
+                      var expected = ('{#CH}' + ': TS Out Loss').toLowerCase();
+                      var lower = v.toLowerCase();
+                      if (lower !== expected && lower !== expected + ' — cleared') return '';
+                      return v;
+              master_item:
+                key: 'snmptrap[trapControlMsgTrap]'
+              trigger_prototypes:
+                - uuid: 678bceca9ade4b79b6f81538e704c98b
+                  expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.HIGH.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.HIGH.WINDOW},"like","— Cleared") >= {$SNMP.TRAP.TSOUT.HIGH.COUNT}'
+                  recovery_mode: RECOVERY_EXPRESSION
+                  recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.HIGH.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.HIGH.WINDOW},"like","— Cleared") < {$SNMP.TRAP.TSOUT.HIGH.COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  name: '{#CH}: TS Out Loss (30s sustained, notify on-call)'
+                  priority: HIGH
+                  manual_close: 'YES'
+                  dependencies:
+                    - name: '{#CH}: TS Out Loss (confirmed 5min outage)'
+                      expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.DISASTER.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.DISASTER.WINDOW},"like","— Cleared") >= {$SNMP.TRAP.TSOUT.DISASTER.COUNT}'
+                      recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.DISASTER.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.DISASTER.WINDOW},"like","— Cleared") < {$SNMP.TRAP.TSOUT.DISASTER.COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  tags:
+                    - tag: channel
+                      value: '{#CH}'
+                    - tag: fault
+                      value: 'TS Out Loss'
+                    - tag: level
+                      value: high
+                    - tag: source
+                      value: vdcm-snmp
+                - uuid: 6043f3bdfd2c4f9995c8d11f4c252468
+                  expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.DISASTER.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.DISASTER.WINDOW},"like","— Cleared") >= {$SNMP.TRAP.TSOUT.DISASTER.COUNT}'
+                  recovery_mode: RECOVERY_EXPRESSION
+                  recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.DISASTER.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.DISASTER.WINDOW},"like","— Cleared") < {$SNMP.TRAP.TSOUT.DISASTER.COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  name: '{#CH}: TS Out Loss (confirmed 5min outage)'
+                  priority: DISASTER
+                  manual_close: 'YES'
+                  tags:
+                    - tag: channel
+                      value: '{#CH}'
+                    - tag: fault
+                      value: 'TS Out Loss'
+                    - tag: level
+                      value: disaster
+                    - tag: source
+                      value: vdcm-snmp
+                - uuid: 551984c749954b59a0639a828bc688c3
+                  expression: '(count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.WARN.DURATION}:{$SNMP.TRAP.TSOUT.WARN.DURATION},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.WARN.DURATION}:{$SNMP.TRAP.TSOUT.WARN.DURATION},"like","— Cleared") >= {$SNMP.TRAP.TSOUT.WARN.COUNT}) and count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.WARN.DURATION},"like","— Cleared")=0'
+                  recovery_mode: RECOVERY_EXPRESSION
+                  recovery_expression: '(count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.WARN.DURATION}:{$SNMP.TRAP.TSOUT.WARN.DURATION},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.WARN.DURATION}:{$SNMP.TRAP.TSOUT.WARN.DURATION},"like","— Cleared") < {$SNMP.TRAP.TSOUT.WARN.COUNT}) or count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.WARN.DURATION},"like","— Cleared")>=1 or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  name: '{#CH}: TS Out Loss (>12s sustained, viewer buffer exhausted)'
+                  priority: WARNING
+                  manual_close: 'YES'
+                  dependencies:
+                    - name: '{#CH}: TS Out Loss (30s sustained, notify on-call)'
+                      expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.HIGH.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.HIGH.WINDOW},"like","— Cleared") >= {$SNMP.TRAP.TSOUT.HIGH.COUNT}'
+                      recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.HIGH.WINDOW},"like",":") - count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.TSOUT.HIGH.WINDOW},"like","— Cleared") < {$SNMP.TRAP.TSOUT.HIGH.COUNT} or nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/snmptrap.tsout[{#CH}],{$SNMP.TRAP.SILENCE:"{#CH}"})=1'
+                  tags:
+                    - tag: channel
+                      value: '{#CH}'
+                    - tag: fault
+                      value: 'TS Out Loss'
+                    - tag: level
+                      value: warning
+                    - tag: source
+                      value: vdcm-snmp
+          master_item:
+            key: vdcm.snmp.ip.map
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var m = {}; try { m = JSON.parse(value) || {}; } catch(e) { return '[]'; }
+                  var placeholder = /^(service\d+|program(\s*\d+)?|channel\d+|input\d+|output\d+)$/i;
+                  var seen = {}; var out = [];
+                  Object.keys(m).forEach(function(k){
+                    var v = String(m[k]||'').trim();
+                    if (!v || placeholder.test(v)) return;
+                    var key = v.toLowerCase();
+                    if (seen[key]) return; seen[key]=1;
+                    out.push({"{#CH}":v});
+                  });
+                  return JSON.stringify(out);
+        - uuid: d78eb49102534b399b887830f62b3996
+          name: 'vDCM active alarms (LLD)'
+          type: DEPENDENT
+          key: vdcm.alarm.discovery
+          item_prototypes:
+            - uuid: 501c2a886ec74a3a8482794d0dbb11ae
+              name: 'vDCM alarm: {#CH}'
+              type: DEPENDENT
+              key: 'vdcm.alarm[{#ALARM_ID}]'
+              history: 7d
+              value_type: CHAR
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - 'var d=JSON.parse(value);var aj=d.alarms_json||[];var id=''{#ALARM_ID}'';for(var i=0;i<aj.length;i++){if(aj[i].id===id)return aj[i].alarm;}return'''';'
+              master_item:
+                key: vdcm.data
+          master_item:
+            key: vdcm.data
+          lld_macro_paths:
+            - lld_macro: '{#ALARM_ID}'
+              path: $.id
+            - lld_macro: '{#CH}'
+              path: $.ch
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.alarms_json
+              error_handler: CUSTOM_ERROR
+              error_handler_params: '[]'
+        - uuid: d4e5f6a7b8c9490692d4e5f6a7b8c9da
+          name: 'vDCM input stream discovery'
+          type: DEPENDENT
+          key: vdcm.input.discovery
+          description: 'Discovers all active input source streams from cards in {$VDCM.INPUT.CARDS}. Creates one bitrate item per unique stream (name + IP:port combination). Trigger prototypes: stream stopped (=0 bps) and low bitrate per stream. Override {$INPUT.BITRATE.WARN} and {$INPUT.BITRATE.MIN} per host. litv_tran2: T_I:1:4 = 14 UDP/SRT physical streams, T_I:1:65532 = 11 RTMP/local streams.'
+          item_prototypes:
+            - uuid: e5f6a7b8c9da490793e5f6a7b8c9daeb
+              name: '{#INNAME} ({#INSRC}) - input bitrate'
+              type: DEPENDENT
+              key: 'vdcm.input.bitrate[{#INKEY}]'
+              history: 90d
+              units: bps
+              description: 'Input source stream {#INNAME} from {#INSRC} current bitrate in bps (auto-scaled to Kbps/Mbps). Zero means the source signal is lost / encoder has no input. Sourced from /bitrates/input/get_rows (real-time, refreshed every 1 min).'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var key = '{#INKEY}';
+                      for (var i = 0; i < data.length; i++) {
+                          if (data[i].key === key) { return String(data[i].bps); }
+                      }
+                      return '0'; // input absent from response = treat as signal lost (bps=0)
+              master_item:
+                key: vdcm.input.bitrates
+              trigger_prototypes:
+                - uuid: f6a7b8c9daeb490894f6a7b8c9daebfc
+                  expression: 'max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.input.bitrate[{#INKEY}],#4)=0'
+                  name: '{#INNAME}: INPUT stream lost (bitrate = 0) [{#INSRC}]'
+                  priority: DISASTER
+                  description: 'Input stream {#INNAME} ({#INSRC}) dropped to zero for 3 consecutive polls (3 min). RTMP 1~2 min reconnect blips are suppressed (require 3 consecutive polls). 3 consecutive zero-bitrate readings reliably indicates a real stream loss. Check source encoder / upstream equipment at {#INSRC}.'
+            - uuid: d6e7f8a9b0c1490bb5d6e7f8a9b0c1d2
+              name: '[Guard] {#INNAME} ({#INSRC}) - output running?'
+              type: DEPENDENT
+              key: 'vdcm.output.for_input[{#INKEY}]'
+              history: 1d
+              value_type: FLOAT
+              trends: '0'
+              units: bps
+              description: |
+                INTERNAL GUARD — not a real bitrate metric. Used only in trigger expressions to suppress false "input low" alarms when the corresponding output channel is still running. Value semantics:
+                  -1 = no matching output found → guard disabled (alarm fires on threshold alone)
+                   0 = output stopped → alarm fires when input is also low
+                  >0 = output running → input low alarm suppressed (VBR/RTMP fluctuation)
+                Source: vdcm.input.bitrates out_kbps field (Port5 SRT match or ABR processing service).
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var key = '{#INKEY}';
+                      for (var i = 0; i < data.length; i++) {
+                          if (data[i].key === key) {
+                              var v = data[i].out_kbps;
+                              if (v === undefined || v < 0) return String(v !== undefined ? v : -1);
+                              return String(v * 1000);
+                          }
+                      }
+                      return '-1';
+              master_item:
+                key: vdcm.input.bitrates
+          trigger_prototypes:
+            - uuid: c9daebfc0d4e4a2ab8c9daebfc0d1e2f
+              expression: 'max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.input.bitrate[{#INKEY}],#4)<{$INPUT.BITRATE.MIN}*1000 and min(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.input.bitrate[{#INKEY}],#4)>0 and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.output.for_input[{#INKEY}])<=0'
+              recovery_mode: RECOVERY_EXPRESSION
+              recovery_expression: 'min(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.input.bitrate[{#INKEY}],#4)>={$INPUT.BITRATE.MIN}*1000 or last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.output.for_input[{#INKEY}])>0'
+              name: '{#INNAME}: input bitrate critically low (below {$INPUT.BITRATE.MIN} Kbps) [{#INSRC}]'
+              priority: HIGH
+              description: |
+                Input stream {#INNAME} ({#INSRC}) bitrate critically below {$INPUT.BITRATE.MIN} Kbps for 3 consecutive polls (3 min), AND Port 5 output is stopped or has no match. Guard: last(vdcm.output.for_input[{#INKEY}]) <= 0
+                  out_kbps > 0 → Port 5 output running → input critically low is VBR/signal issue → suppressed
+                  out_kbps = 0 → Port 5 output stopped → real encoding fault → alert fires
+                  out_kbps = -1 → no matching Port 5 channel → guard disabled → fires on threshold
+                Urgent action required. Check source encoder at {#INSRC}. Current value: {ITEM.LASTVALUE}.
+            - uuid: a7b8c9daebfc490995a7b8c9daebfc0d
+              expression: 'max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.input.bitrate[{#INKEY}],#5)<{$INPUT.BITRATE.WARN}*1000 and max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.input.bitrate[{#INKEY}],#5)>={$INPUT.BITRATE.MIN}*1000 and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.output.for_input[{#INKEY}])<=0'
+              recovery_mode: RECOVERY_EXPRESSION
+              recovery_expression: 'min(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.input.bitrate[{#INKEY}],#5)>={$INPUT.BITRATE.WARN}*1000 or last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.output.for_input[{#INKEY}])>0'
+              name: '{#INNAME}: input bitrate low (below {$INPUT.BITRATE.WARN} Kbps) [{#INSRC}]'
+              priority: WARNING
+              description: |
+                Input stream {#INNAME} ({#INSRC}) bitrate below {$INPUT.BITRATE.WARN} Kbps for 5 consecutive polls (5 min sustained), AND the corresponding Port 5 output channel ({$VDCM.OUTPUT.CARD}) is stopped or has no match (out_kbps <= 0). Guard: last(vdcm.output.for_input[{#INKEY}]) <= 0
+                  out_kbps > 0 → Port 5 output running → input low is VBR fluctuation → suppressed
+                  out_kbps = 0 → Port 5 output stopped → real encoding fault → alert fires
+                  out_kbps = -1 → no matching Port 5 channel → guard disabled → fires on threshold
+                Matching logic: exact name OR channel-name-prefix (before ' (') vs output table col[10]. Example: "DayStarMain" matches "DayStarMain (1920x1080p29.97 @ 5000 kbps) (MR)". Check upstream encoder at {#INSRC}. Current value: {ITEM.LASTVALUE}.
+          master_item:
+            key: vdcm.input.bitrates
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var data = JSON.parse(value);
+                  return JSON.stringify(data.map(function(s) {
+                      return {
+                          '{#INKEY}':  s.key,
+                          '{#INNAME}': s.name,
+                          '{#INIP}':   s.ip,
+                          '{#INPORT}': s.port,
+                          '{#INSRC}':  s.src
+                      };
+                  }));
+        - uuid: d5e6f7a8b9ca4d4ebcd5e6f7a8b9cadb
+          name: 'vDCM Port 5 SRT output stream discovery'
+          type: DEPENDENT
+          key: vdcm.port5.discovery
+          description: |
+            Discovers all TS_S and TS_S_P (SRT) output streams on Port 5 ({$VDCM.OUTPUT.CARD}). Creates bitrate + connection-status items and trigger prototypes per discovered stream. All named streams included (including TS_S Program N such as Tran2 Program 1 ~3.6 Mbps). Verified on litv_tran1 (TS_S): TVBSN SRT, EBCNews SRT, EBCF, FTV-HD SRT (~9.8 Mbps). Verified on litv_tran2: CTSMainSRT/TS_S (~7.8 Mbps), Program 1/TS_S (~3.6 Mbps);
+              TVBSN SRT/EBCNews SRT/EBCF SRT/FTV-HD SRT (TS_S_P passthrough, on=1 bps=0).
+            Trigger logic: stopped=bitrate=0 and on=0; low=bitrate<WARN and on=1; TS_S_P passthrough will not false-alarm. Threshold macros: {$PORT5.BITRATE.WARN} (5 Mbps), {$PORT5.BITRATE.MIN} (2 Mbps).
+          item_prototypes:
+            - uuid: e6f7a8b9cadb4e5f8de6f7a8b9cadbec
+              name: '{#STREAM.NAME} - Port 5 SRT output bitrate'
+              type: DEPENDENT
+              key: 'vdcm.port5.stream.bitrate[{#STREAM.NAME}]'
+              history: 90d
+              units: bps
+              description: 'Current output bitrate for SRT stream {#STREAM.NAME} on Port 5 ({$VDCM.OUTPUT.CARD}) in Kbps. Sourced from /service/overview/opennode2 tooltip "cur: X.X" field (TS_S node type). Zero means the SRT output stream has stopped.'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var name = '{#STREAM.NAME}';
+                      for (var i = 0; i < data.length; i++) {
+                          if (data[i].name === name) { return String(data[i].bps); }
+                      }
+                      throw new Error(name + ' not found in vdcm.port5.bitrates response');
+              master_item:
+                key: vdcm.port5.bitrates
+              trigger_prototypes:
+                - uuid: b9cadbecfd0e4b81bfb9cadbecfd0e1f
+                  expression: 'max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.stream.bitrate[{#STREAM.NAME}],#4)<{$PORT5.BITRATE.MIN}*1000 and max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.stream.bitrate[{#STREAM.NAME}],#4)>0'
+                  name: '{#STREAM.NAME}: SRT output critically low (below {$PORT5.BITRATE.MIN} Kbps)'
+                  priority: DISASTER
+                  description: 'SRT output stream {#STREAM.NAME} bitrate critically below {$PORT5.BITRATE.MIN} Kbps. Stream is nearly stopped. Check vDCM Outputs > I/O 1 > Port 5 ({$VDCM.OUTPUT.CARD}).'
+            - uuid: 979f7f94b7fe4df983bb9c9ebf567b3a
+              name: '{#STREAM.NAME} - Port 5 SRT connection status'
+              type: DEPENDENT
+              key: 'vdcm.port5.stream.on[{#STREAM.NAME}]'
+              history: 90d
+              description: 'SRT stream connection state: 1=ON (connected/receiver present), 0=OFF (disconnected). Extracted from opennode2 title: " ON " present → 1, otherwise → 0. Applies to both TS_S (re-encode) and TS_S_P (passthrough) stream types.'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var name = '{#STREAM.NAME}';
+                      for (var i = 0; i < data.length; i++) {
+                          if (data[i].name === name) {
+                              return String(data[i].on !== undefined ? data[i].on : 1);
+                          }
+                      }
+                      throw new Error(name + ' not found in vdcm.port5.bitrates response');
+              master_item:
+                key: vdcm.port5.bitrates
+          trigger_prototypes:
+            - uuid: a8b9cadbecfd4a70afa8b9cadbecfd0e
+              expression: 'max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.stream.bitrate[{#STREAM.NAME}],#4)<{$PORT5.BITRATE.WARN}*1000 and max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.stream.bitrate[{#STREAM.NAME}],#4)>={$PORT5.BITRATE.MIN}*1000 and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.stream.on[{#STREAM.NAME}])=1'
+              name: '{#STREAM.NAME}: SRT output bitrate low (below {$PORT5.BITRATE.WARN} Kbps)'
+              priority: HIGH
+              description: 'SRT output stream {#STREAM.NAME} bitrate below {$PORT5.BITRATE.WARN} Kbps for 3 polls but still >= {$PORT5.BITRATE.MIN} Kbps (degraded but not critically low). TS_S_P passthrough streams (on=1, bps=0) will not trigger this alert (guarded by on=1 condition). Override {$PORT5.BITRATE.WARN} per host to match expected bitrate.'
+            - uuid: f7a8b9cadbec4f6f8ef7a8b9cadbecfd
+              expression: 'max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.stream.bitrate[{#STREAM.NAME}],#4)=0 and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.stream.on[{#STREAM.NAME}])=0'
+              name: '{#STREAM.NAME}: SRT output stopped (bitrate=0 and connection down)'
+              priority: DISASTER
+              description: 'SRT output stream {#STREAM.NAME} bitrate=0 and connection=OFF for 3 consecutive polls. TS_S_P passthrough streams always have bitrate=0 but on=1, so they will not trigger this alert. Check vDCM Outputs > I/O 1 > Port 5 ({$VDCM.OUTPUT.CARD}).'
+          master_item:
+            key: vdcm.port5.bitrates
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var data = JSON.parse(value);
+                  return JSON.stringify(data.map(function(s) {
+                      return { '{#STREAM.NAME}': s.name, '{#STREAM.ON}': String(s.on !== undefined ? s.on : 1) };
+                  }));
+        - uuid: 428ce9fdd3914da8b3145f3997a538a1
+          name: 'vDCM encoding services discovery'
+          type: DEPENDENT
+          key: vdcm.services.discovery
+          description: 'Discovers all S-type encoding services on this vDCM device by parsing vdcm.services.bitrates. Creates one heartbeat item per service. The heartbeat value (cur: ~0.2~0.4 Mbps) is a vMFP internal keepalive, NOT the real output bitrate. It drops to 0 only when the vMFP service itself crashes. The sole trigger is DISASTER (= 0) to catch service crash.'
+          item_prototypes:
+            - uuid: 8f323aeeb61949e59d2cb1a01ba8f5f4
+              name: '{#SVCNAME} - service heartbeat'
+              type: DEPENDENT
+              key: 'vdcm.bitrate[{#SVCNAME}]'
+              history: 90d
+              units: bps
+              description: '{#SVCTITLE} vMFP service internal heartbeat value in bps. Source: opennode2 tooltip "cur" field for processing node {$VDCM.PROC.NODE}. NOTE: This is NOT the real output bitrate. The ~0.2~0.4 Mbps value is vDCM internal IPC keepalive between vMFP transcoder modules. Zero means the vMFP service has crashed (not just low bitrate). For real output bitrate, see vdcm.port5.stream.bitrate[*] (SRT output). For real input bitrate, see vdcm.input.bitrate[*].'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var name = '{#SVCNAME}';
+                      for (var i = 0; i < data.length; i++) {
+                          if (data[i].name === name) { return String(data[i].bps); }
+                      }
+                      return '0'; // service absent from response = treat as crashed (bps=0)
+              master_item:
+                key: vdcm.services.bitrates
+          trigger_prototypes:
+            - uuid: d0e1f2a3b4c5490c89d0e1f2a3b4c596
+              expression: 'max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.bitrate[{#SVCNAME}],#4)=0 and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.output.stopped_count)>0'
+              recovery_mode: RECOVERY_EXPRESSION
+              recovery_expression: 'max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.bitrate[{#SVCNAME}],#4)>0 and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.output.stopped_count)=0'
+              name: '{#SVCNAME}: vMFP service crashed (heartbeat = 0)'
+              priority: DISASTER
+              description: 'vMFP service {#SVCNAME} heartbeat has been zero for 3 consecutive polls (3 min) AND output stopped_count > 0 (confirmed: encoding has stopped). Recovery requires BOTH heartbeat > 0 AND stopped_count = 0 (all outputs running again). Check vDCM Status > Processing at {$VDCM.URL}.'
+          master_item:
+            key: vdcm.services.bitrates
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var data = JSON.parse(value);
+                  return JSON.stringify(data.map(function(s) {
+                      return { '{#SVCNAME}': s.name, '{#SVCTITLE}': s.title };
+                  }));
+      macros:
+        - macro: '{$INPUT.BITRATE.MIN}'
+          value: '500'
+          description: 'Critical threshold for INPUT source stream bitrate in Kbps. Trigger fires when input bitrate drops below this value but is still > 0. Default 500 Kbps = severely degraded / signal nearly lost. Observed litv_tran1 stream minimums: high-bitrate ≥9767, mid ≥5515, low ≥504. Override per host for scheduled low-bitrate streams (e.g. DayStarMain: set 300).'
+        - macro: '{$INPUT.BITRATE.WARN}'
+          value: '2500'
+          description: |
+            Warning threshold for INPUT source stream bitrate in Kbps. Trigger fires when input bitrate drops below this value but is still > 0. Default 2500 Kbps (2.5 Mbps). Observed ranges on litv_tran1:
+              High-bitrate streams (EBC/FTV/TVBS/CTI): 9700-9900 Kbps → WARN irrelevant (only=0 matters)
+              Mid-bitrate streams (CTSNews/SET/iNews): 5500-7300 Kbps → WARN=2500 catches real drops
+              Low-bitrate streams (NownewsCht): avg 2795 Kbps → override per-host to 1500
+              Scheduled low-bitrate (DayStarMain): avg 2050 Kbps active hrs → override per-host to 1500
+            Override per host macro {$INPUT.BITRATE.WARN} to match expected stream bitrate.
+        - macro: '{$INPUT.NAME.MAP}'
+          value: '{}'
+          description: 'Manual fallback map for "Program NNN" streams whose SID is not unique in the service tree (e.g. SID=1 appears in many TS streams and is ambiguous). Auto-naming via the opennode2 service tree handles unique SIDs automatically. Key = "IP:Port:SID", value = channel name. Example: {"230.0.0.26:3539:1":"MyChannel","230.0.0.27:3539:1":"OtherChannel"} Set as per-host override. After saving, wait ~5 min for Zabbix LLD to apply.'
+        - macro: '{$INPUT.PROC.NAME.MAP}'
+          value: '{}'
+          description: |
+            Manual mapping of INPUT stream name → Processing service name, ONLY for streams where names have NO structural relationship and cannot be auto-matched. The script already auto-resolves via: exact match, SRT-strip, space normalization, and normalized prefix overlap (common prefix of lowercase+stripped names ≥ 60%). Auto-resolved examples (no entry needed):
+              "FTV" → "FTV-HD" or "FTV NEWS", "EBC" → "EBCNews*", "CTV News" → "CTVNewsQT"
+              "SET iNEWS" → "SETiNewsRTMP" (tran1 only), "EBCFNews QT" → "EBCFNews QT"
+              "CTS News Information Channe" → "CTSNewsQT" (handles vDCM API truncation)
+            Entries needed for truly unresolvable cases OR where auto-match gives wrong result:
+              litv_tran1: {"SET iNEWS":"SET-88"}
+                SET-88 = iNEWS channel (SET Television ch.88); auto-match incorrectly maps
+                "SET iNEWS" to "SETiNewsRTMP" via prefix overlap, manual override fixes this.
+                TVBS input (RTMP) has no matching processing service on tran1 → guard disabled,
+                but TVBS cur ~9.8 Mbps is far above any threshold so this is safe.
+              litv_tran2: {"SET iNEWS":"SETNewsRTMP"}
+                iNewsQT input on tran2 has no corresponding processing service (tran2 does not
+                process iNews); guard is disabled but cur ~6.8 Mbps is well above any threshold.
+            Key = exact input name (from bitrates/input table). Value = Processing service name (full name before first ‘(‘ in title, as shown in service overview). Set as per-host macro override. Template default {} is safe (auto-match handles most).
+        - macro: '{$PORT5.BITRATE.MIN}'
+          value: '2000'
+          description: 'Critical threshold (Kbps) for Port 5 SRT output streams. Fires when stream bitrate drops below this value but is still > 0. Default 2000 Kbps (2 Mbps). Override per host if needed.'
+        - macro: '{$PORT5.BITRATE.WARN}'
+          value: '5000'
+          description: 'Warning threshold (Kbps) for Port 5 SRT output streams. Fires when stream bitrate drops below this value but is still > 0. Default 5000 Kbps (5 Mbps). litv_tran1 SRT streams ~9800 Kbps; litv_tran2 CTSMainSRT ~6400 Kbps. Override per host: e.g. 7000 for high-bitrate SRT.'
+        - macro: '{$SNMP.IP.MAP}'
+          value: '{}'
+          description: 'JSON map of multicast TS IP:port → channel name for SNMP trap alarm display. Used when trap msgDetail has no GroupName (e.g. CC Error, TS Sync Loss on hardware alarms). Example: {"229.0.0.8:8000":"SETiNews","229.0.0.9:8000":"CTSNews","229.0.0.10:8000":"FTVNews"}. Set as per-host override to match TS multicast assignments.'
+        - macro: '{$SNMP.TRAP.P1_MIN_COUNT}'
+          value: '10'
+          description: 'P1 (Disaster) tier: fires after this many net-raise (non-Cleared minus Cleared) traps in {$SNMP.TRAP.P1_WINDOW}. Applies to critical service-loss faults (Service Loss, Service loss at output, Video Input Loss, Audio Input Loss, TS Loss, TS Sync Loss). Calibrated: Synamedia sends update-active every 3-5s during real fault, so 10 traps ≈ 30-50s sustained outage before alerting; short flaps are filtered. Per-channel override via host macro {$SNMP.TRAP.P1_MIN_COUNT:<channel>}, e.g. {$SNMP.TRAP.P1_MIN_COUNT:DayStar}=15 to reduce false alerts on chronic-flap upstream sources.'
+        - macro: '{$SNMP.TRAP.P1_WINDOW}'
+          value: 5m
+          description: 'P1 (Disaster) tier: rolling window used to count non-Cleared traps for critical faults.'
+        - macro: '{$SNMP.TRAP.P2_MIN_COUNT}'
+          value: '20'
+          description: 'P2 (Average) tier: fires after this many non-Cleared traps in {$SNMP.TRAP.P2_WINDOW}. Applies to TS Out Loss, Packager Input Data Loss, EBP out of sync, Bandwidth Exceeded.'
+        - macro: '{$SNMP.TRAP.P2_WINDOW}'
+          value: 15m
+          description: 'P2 (Average) tier: rolling window for sustained faults.'
+        - macro: '{$SNMP.TRAP.P3_MIN_COUNT}'
+          value: '100'
+          description: 'P3 (Warning) tier: fires after this many non-Cleared traps in {$SNMP.TRAP.P3_WINDOW}. Applies to PTS Discontinuity, CC Error, User Selected PCR PID Error, No PCR Present. Calibrated to real-world traffic: observed 24h peak ≈ 58 traps/60min (CTVMainQT PTS Discontinuity); 100 gives ~1.7× headroom above chronic baseline while still catching sustained quality degradation.'
+        - macro: '{$SNMP.TRAP.P3_WINDOW}'
+          value: 60m
+          description: 'P3 (Warning) tier: rolling window for chronic noise.'
+        - macro: '{$SNMP.TRAP.PKGCFG.AVG.COUNT}'
+          value: '10'
+          description: 'Packager Input Stream Config Mismatch escalation Average tier: fires when net raise (count(":") minus cleared) reaches this in {$SNMP.TRAP.PKGCFG.AVG.WINDOW}. ~30s sustained; investigate input stream configuration or upstream encoder settings.'
+        - macro: '{$SNMP.TRAP.PKGCFG.AVG.WINDOW}'
+          value: 5m
+          description: 'Packager Input Stream Config Mismatch escalation Average tier: rolling window for ~30s sustained confirmation.'
+        - macro: '{$SNMP.TRAP.PKGCFG.HIGH.COUNT}'
+          value: '60'
+          description: 'Packager Input Stream Config Mismatch escalation High tier: fires when net raise reaches this in {$SNMP.TRAP.PKGCFG.HIGH.WINDOW}. ~5min chronic; page engineering. Synamedia msgSeverity=2 (Major), so top tier is HIGH, not Disaster.'
+        - macro: '{$SNMP.TRAP.PKGCFG.HIGH.WINDOW}'
+          value: 10m
+          description: 'Packager Input Stream Config Mismatch escalation High tier: rolling window for ~5min chronic confirmation.'
+        - macro: '{$SNMP.TRAP.PKGCFG.WARN.COUNT}'
+          value: '5'
+          description: 'Packager Input Stream Config Mismatch escalation Warning tier: fires when net raise (count(":") minus cleared) reaches this in {$SNMP.TRAP.PKGCFG.WARN.WINDOW}. First-detect signal, watching for confirmation. Cleared traps do not count as raises to avoid false fire on clear-only bursts. Calibrated to OTT buffer tolerance (~15-25s sustained before Warning fires; brief <15s flaps filtered).'
+        - macro: '{$SNMP.TRAP.PKGCFG.WARN.WINDOW}'
+          value: 2m
+          description: 'Packager Input Stream Config Mismatch escalation Warning tier: rolling window for first-detect count.'
+        - macro: '{$SNMP.TRAP.PKGPART.AVG.COUNT}'
+          value: '10'
+          description: 'Packager Output Partitioning Failure escalation Average tier: fires when net raise (count(":") minus cleared) reaches this in {$SNMP.TRAP.PKGPART.AVG.WINDOW}. ~30s sustained; investigate packager or upstream time base.'
+        - macro: '{$SNMP.TRAP.PKGPART.AVG.WINDOW}'
+          value: 5m
+          description: 'Packager Output Partitioning Failure escalation Average tier: rolling window for ~30s sustained confirmation.'
+        - macro: '{$SNMP.TRAP.PKGPART.HIGH.COUNT}'
+          value: '60'
+          description: 'Packager Output Partitioning Failure escalation High tier: fires when net raise reaches this in {$SNMP.TRAP.PKGPART.HIGH.WINDOW}. ~5min chronic; page engineering. Synamedia msgSeverity=2 (Major), so top tier is HIGH, not Disaster.'
+        - macro: '{$SNMP.TRAP.PKGPART.HIGH.WINDOW}'
+          value: 10m
+          description: 'Packager Output Partitioning Failure escalation High tier: rolling window for ~5min chronic confirmation.'
+        - macro: '{$SNMP.TRAP.PKGPART.WARN.COUNT}'
+          value: '5'
+          description: 'Packager Output Partitioning Failure escalation Warning tier: fires when net raise (count(":") minus cleared) reaches this in {$SNMP.TRAP.PKGPART.WARN.WINDOW}. First-detect signal, watching for confirmation. Cleared traps do not count as raises to avoid false fire on clear-only bursts. Calibrated to OTT buffer tolerance (~15-25s sustained before Warning fires; brief <15s flaps filtered).'
+        - macro: '{$SNMP.TRAP.PKGPART.WARN.WINDOW}'
+          value: 2m
+          description: 'Packager Output Partitioning Failure escalation Warning tier: rolling window for first-detect count.'
+        - macro: '{$SNMP.TRAP.SILENCE}'
+          value: 60m
+          description: 'Default cooldown after last matching trap: problem stays open while flapping, only recovers after this long of complete quiet on this (channel × fault). Per-channel override via host macro {$SNMP.TRAP.SILENCE:<channel>}, e.g. {$SNMP.TRAP.SILENCE:DayStar}=2h for chronic upstream flap.'
+        - macro: '{$SNMP.TRAP.TSOUT.DISASTER.COUNT}'
+          value: '60'
+          description: 'TS Out Loss escalation Disaster tier: fires when net raise reaches this in {$SNMP.TRAP.TSOUT.DISASTER.WINDOW}. ~5min confirmed outage; emergency escalation.'
+        - macro: '{$SNMP.TRAP.TSOUT.DISASTER.WINDOW}'
+          value: 10m
+          description: 'TS Out Loss escalation Disaster tier: rolling window for ~5min confirmed extended outage.'
+        - macro: '{$SNMP.TRAP.TSOUT.HIGH.COUNT}'
+          value: '10'
+          description: 'TS Out Loss escalation High tier: fires when net raise (count(":") minus cleared) reaches this in {$SNMP.TRAP.TSOUT.HIGH.WINDOW}. ~30s sustained outage; notify on-call.'
+        - macro: '{$SNMP.TRAP.TSOUT.HIGH.WINDOW}'
+          value: 5m
+          description: 'TS Out Loss escalation High tier: rolling window for ~30s sustained confirmation.'
+        - macro: '{$SNMP.TRAP.TSOUT.WARN.COUNT}'
+          value: '3'
+          description: 'TS Out Loss Warning tier (duration-based): profiles-per-outage threshold. Synamedia sends 1 trap per output profile per outage (typically 4 profiles). Fire requires this many net raises without cleared for the {$SNMP.TRAP.TSOUT.WARN.DURATION} window. Default 3 = 3/4 profiles affected = viewer likely impacted. Calibrated to detect real single outage exceeding player buffer tolerance.'
+        - macro: '{$SNMP.TRAP.TSOUT.WARN.DURATION}'
+          value: 12s
+          description: 'TS Out Loss Warning tier (duration-based): player buffer tolerance. Fires only if outage persists longer than this. HLS/DASH players buffer ~3 segments (12s at 4s/segment). Outages shorter than this are absorbed by player buffer with zero viewer impact. Adjust to match your player buffer size.'
+        - macro: '{$VDCM.ALARM.COUNT.MAX}'
+          value: '0'
+        - macro: '{$VDCM.INPUT.CARDS}'
+          value: 'T_I:1:4,T_I:1:65532'
+          description: 'Comma-separated list of input card xIDs for /bitrates/input monitoring. T_I:1:4 = physical NIC inputs (Port 5 Input/Mgmt, UDP/SRT streams). T_I:1:65532 = local/RTMP/SRT software inputs. Override per host if your device has different card IDs. Find card IDs: open /bitrates/input in browser DevTools, check s_xID parameter in XHR request to /bitrates/input/get_rows.'
+        - macro: '{$VDCM.OUTPUT.CARD}'
+          value: 'T_O:1:4'
+          description: 'Output card xID for Port 5 (Outputs > I/O 1 > Port 5). Used for (1) INPUT alarm guard condition and (2) direct Port 5 SRT stream monitoring. Default T_O:1:4. Verified for litv_tran1/tran2. Override per host if different.'
+        - macro: '{$VDCM.PASS}'
+          type: SECRET_TEXT
+          description: 'vDCM web login password. Set per-host override as Secret macro.'
+        - macro: '{$VDCM.PROC.CARDS}'
+          value: 'T_I:2:0'
+          description: 'Comma-separated list of vMFP card xIDs for /status/processing monitoring. T_I:2:0 = vMFP board (encoding/transcoding processing alarms). On Tran1/Tran2: processing alarms are on vMFP (T_I:2:0), NOT the network input cards. On FTV/SPORTCAST: processing cards are the same as input cards (T_I:2:0~3 SDI). Note: this macro is separate from {$VDCM.INPUT.CARDS} to allow independent override.'
+        - macro: '{$VDCM.PROC.EXCLUDE}'
+          description: 'Comma-separated substrings; services whose name contains any of these are skipped. Default: empty (monitor all services). Set to ''RTMP'' per host if needed.'
+        - macro: '{$VDCM.PROC.NODE}'
+          value: 'T_T:2:*:*:e0'
+          description: 'Processing node key for /service/overview/opennode2. T_T:2:*:*:e0 works for litv_tran1 (211.21.3.208), litv_tran2 (211.21.3.210) and most single-node vDCM deployments. Find from browser DevTools Network tab: look for opennode2 POST xID parameter.'
+        - macro: '{$VDCM.URL}'
+          description: 'vDCM base URL, no trailing slash. E.g. https://211.21.3.208:4431 or https://60.251.153.74'
+        - macro: '{$VDCM.USER}'
+          value: Administrator
+          description: 'vDCM web login username'
+        - macro: '{$VIDEO.BITRATE.MIN}'
+          value: '50'
+          description: 'Critical threshold in Kbps. Trigger fires when service bitrate drops below this value but is still > 0. Default 50 (0.05 Mbps) suits ABR/OTT transcoding services. Override per host for broadcast: e.g. 2000 for 8 Mbps services.'
+        - macro: '{$VIDEO.BITRATE.WARN}'
+          value: '150'
+          description: 'Warning threshold in Kbps. Trigger fires when service bitrate drops below this value but is still > 0. Default 150 (0.15 Mbps) suits ABR/OTT transcoding services (litv_tran1/tran2 normal range: 200-400 Kbps). Override per host for broadcast: e.g. 5000 for 8 Mbps services.'
+  triggers:
+    - uuid: fd14a1e964414317b53c45daeb72f103
+      expression: 'min(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.proc.bitrate,2m)=0 and nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.proc.bitrate,5m)=0 and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.device.vdcm_state)="Active"'
+      name: 'vDCM: all encoding stopped (total output = 0 bps)'
+      priority: DISASTER
+      manual_close: 'YES'

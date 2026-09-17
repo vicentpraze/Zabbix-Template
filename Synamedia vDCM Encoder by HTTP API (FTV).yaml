@@ -1,0 +1,563 @@
+zabbix_export:
+  version: '7.4'
+  template_groups:
+    - uuid: c7691cb0ae02412a87bcda2e1db5184c
+      name: 'Templates/Network devices'
+  templates:
+    - uuid: 1d1f704eb7234abfb6809679af17cad7
+      template: 'Synamedia vDCM Encoder by HTTP API - FTV'
+      name: 'Synamedia vDCM Encoder by HTTP API (FTV)'
+      description: |
+        Synamedia vDCM HTTP API monitor for LiTV_FTV_SRT (61.220.40.194:4431).
+        Encoding: 4 services (EBC/TVBS/FTV/EBCF) from SDI input T_I:2:0~T_I:2:3 (Kona4_1), total ~39.6 Mbps. Output: 8 SRT streams on Port 3 Mgmt (T_O:1:2) to 2 destinations (218.211.161.8, 211.21.3.210). Alarms: alarm_count correlated with filtered alarm detail (background noise excluded). SDI: 4 input signal monitors (T_I:2:0~T_I:2:3). Processing alarms per SDI card. Note: T_I:2:4 does NOT exist on this device (verified 2026-06-11).
+      vendor:
+        name: LiTV
+        version: 7.4.11
+      groups:
+        - name: 'Templates/Network devices'
+      items:
+        - uuid: 9a1b2c3d4e5f4819a89a1b2c3d4e5f68
+          name: 'vDCM device alarm details (non-background)'
+          type: DEPENDENT
+          key: vdcm.alarms.detail
+          history: 90d
+          value_type: TEXT
+          description: 'Queries /status/alarms/get_rows and filters out permanent background noise. Returns "OK" when only background noise present. Returns alarm details (e.g. "Major | Equipment Fault | Board 1") for real faults. NOTE: This device returns HTTP 204 on /status/alarms/get_rows (firmware limitation). Fallback: parses tbldevicealarms table from the /status page instead. Background noise (SDI input): PTS Discontinuity, UDP/TS Stream Loss. Input Signal Loss is NOT suppressed — SDI signal loss on EBC/TVBS/FTV/EBCF is a real fault.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.alarms_detail
+          master_item:
+            key: vdcm.data
+        - uuid: 32e82d8ae1c046fca997c204343b5e88
+          name: 'vDCM master data (all-in-one)'
+          type: SCRIPT
+          key: vdcm.data
+          delay: 30s
+          history: 1h
+          value_type: TEXT
+          params: |
+            // vDCM Master Data Collector — FTV
+            var url='{$VDCM.URL}'.replace(/\/+$/,''),user='{$VDCM.USER}',pass='{$VDCM.PASS}';
+            var cards='{$VDCM.INPUT.CARDS}'.split(',').map(function(s){return s.trim();}).filter(Boolean);
+            var procNode='{$VDCM.PROC.NODE}',outCard='{$VDCM.OUTPUT.CARD}';
+            var sdiNodes='{$VDCM.SDI.NODES}'.split(',').map(function(s){return s.trim();}).filter(Boolean);
+            if(!url||url.indexOf('http')!==0)throw new Error('Invalid {$VDCM.URL}: "'+url+'"');
+            function _doLogin(){var lg=new HttpRequest();try{lg.setopt(64,0);}catch(e){}try{lg.setopt(81,0);}catch(e){}try{lg.setopt(52,0);}catch(e){}lg.addHeader('Content-Type: application/x-www-form-urlencoded');lg.post(url+'/login_handler?came_from=%2F','login='+encodeURIComponent(user)+'&password='+encodeURIComponent(pass)+'&login_button=Login');var ck=[];try{var hd=lg.getHeaders(false);if(hd&&typeof hd==='object'&&!Array.isArray(hd)){Object.keys(hd).forEach(function(k){if(k.toLowerCase()==='set-cookie'){var v=hd[k];(Array.isArray(v)?v:[v]).forEach(function(c){var p=c.split(';')[0].trim();if(p)ck.push(p);})}});}}catch(e){}if(ck.length===0){try{var rh=lg.getHeaders(true);if(typeof rh!=='string')rh=String(rh);(rh.match(/Set-Cookie:\s*([^\r\n]+)/ig)||[]).forEach(function(m){var p=m.replace(/^Set-Cookie:\s*/i,'').split(';')[0].trim();if(p)ck.push(p);});}catch(e){}}return ck;}
+            var cookies=_doLogin();
+            if(cookies.length===0){try{Duktape.gc();}catch(e){}cookies=_doLogin();}
+            if(cookies.length===0)throw new Error('Login failed after retry. Check {$VDCM.URL}/{$VDCM.USER}/{$VDCM.PASS}.');
+            var api=new HttpRequest();
+            try{api.setopt(64,0);}catch(e){}try{api.setopt(81,0);}catch(e){}
+            try{api.setopt(13,30);}catch(e){}try{api.setopt(78,10);}catch(e){}
+            api.addHeader('Content-Type: application/x-www-form-urlencoded');
+            api.addHeader('Cookie: '+cookies.join('; '));
+            function _logout(){}
+            var _sv=api.get(url+'/load_alarm_footer');
+            if(_sv&&_sv.indexOf('action="/login_handler"')>=0)throw new Error('Session invalid immediately after login (login page returned). Check vDCM session limit or concurrent login policy.');
+            function _d(r){return String(r||'').replace(/&quot;/g,'"').replace(/&amp;/g,'&').replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>');}
+            function _t(pg,nm){var mk=nm+"='",ii=(pg||'').indexOf(mk);if(ii<0)return[];var jj=pg.indexOf("';",ii+mk.length);if(jj<0)return[];try{return JSON.parse(_d(pg.substring(ii+mk.length,jj)));}catch(e){return[];}}
+            function _h(s){return String(s||'').replace(/<[^>]+>/g,'').trim();}
+            var R_dev={alarm_count:-1,device_state:'unknown',vdcm_state:'unknown'};
+            try{var _dr=_sv;if(_dr){var _am=_dr.match(/device_status'\)\.textContent\s*=\s*'([^']*)'/),_sm=_dr.match(/device_state'\)\.textContent\s*=\s*'([^']*)'/),_vm=_dr.match(/vdcm_state'\)\.textContent\s*=\s*'([^']*)'/);R_dev={alarm_count:_am?parseInt(_am[1],10):-1,device_state:_sm?_sm[1]:'unknown',vdcm_state:_vm?_vm[1]:'unknown'};}}catch(e){}
+            var R_alm='ERROR';
+            try{
+            var _sp=null;
+            var NOISE=['PTS Discontinuity','UDP Stream Loss','TS Stream Loss','Destination IP Not Reachable Through ICMP'];
+            var _ar=api.post(url+'/status/alarms/get_rows','table_id=status_alarm_table&paging_info_status_alarm_table='+encodeURIComponent('{"start_row":0,"rows_to_show":500}'));
+            var _ac=api.getStatus(),_alr=null;
+            if(_ar&&_ac!==204){var _mk="tbl_data_status_alarm_table='",_i=_ar.indexOf(_mk);if(_i>=0){var _s=_i+_mk.length,_e=_ar.indexOf("';",_s);if(_e>=0)try{_alr=JSON.parse(_d(_ar.substring(_s,_e)));}catch(e){}}}
+            if(_alr===null){
+            _sp=api.get(url+'/status');var _tot=0;
+            ['tbl_data_tbldevicealarms','tbl_data_tblioalarms'].forEach(function(t){_t(_sp,t).forEach(function(r){(r.values||[]).forEach(function(c){var s=(typeof c==='object'&&c!==null)?JSON.stringify(c):String(c||'');if(s.charAt(0)==='{'){var _oc=null;try{_oc=JSON.parse(s);}catch(e){try{_oc=JSON.parse(_d(s));}catch(e2){}}if(_oc&&_oc['class']==='LinkControl')_tot+=parseInt(_oc.content,10)||0;}});});});
+            if(_tot>0){var _dp=api.get(url+'/status/device'),_dr2=_t(_dp,'tbl_data_device_detail_table');_alr=_dr2.length>0?_dr2:_t(_sp,'tbl_data_tbldevicealarms');}
+            else _alr=_t(_sp,'tbl_data_tbldevicealarms');
+            }
+            var _as={},_ap=[];
+            _alr.forEach(function(row){var v=row.values||[],_lc2=false,_tx=[];v.forEach(function(cell){var lc=(cell&&typeof cell==='object')?cell:null;if(!lc){var s=String(cell||'');if(s.charAt(0)==='{'){try{lc=JSON.parse(s);}catch(e){try{lc=JSON.parse(s.replace(/\\"/g,'"'));}catch(e2){try{lc=JSON.parse(_d(s));}catch(e3){}}}}}if(lc&&lc['class']==='LinkControl'){_lc2=true;return;}var t=_h(String(cell||''));var tn=t.replace(/\\"/g,'"');if(tn.indexOf('"class":"LinkControl"')>=0||tn.indexOf('"class": "LinkControl"')>=0){_lc2=true;return;}if(t.length>1&&!/^\d+$/.test(t))_tx.push(t);});_tx=_tx.filter(function(x){if(x.indexOf('LinkControl')<0)return true;var xn=x.replace(/\\"/g,'"');if(xn.indexOf('"class":"LinkControl"')>=0||xn.indexOf('"class": "LinkControl"')>=0)return false;try{var _o=JSON.parse(xn);return _o['class']!=='LinkControl';}catch(e){return true;}});if(NOISE.some(function(n){return _tx.some(function(t){return t.indexOf(n)>=0;})})||_lc2)return;if(_tx.length>0){var e=_tx.join(' | ');if(!_as[e]){_as[e]=true;_ap.push(e);}}});
+            if(!_sp)_sp=api.get(url+'/status');
+            var _IOCAT={'input?filter=TS':'Input-TS','output?filter=TS':'Out-TS'};
+            function _td(html,nm){var mk=nm+"='",ii=(html||'').indexOf(mk);if(ii<0)return[];var jj=html.indexOf("';",ii+mk.length);if(jj<0)return[];try{return JSON.parse(_d(html.substring(ii+mk.length,jj)).replace(/\\'/g,"'"));}catch(e){return[];}}
+            try{_t(_sp,'tbl_data_tblioalarms').forEach(function(row){var v=row.values||[];var _pn=_h(String(v[1]||v[0]||''));v.forEach(function(cell){var s=String(cell||'');if(s.charAt(0)!=='{')return;try{var o=JSON.parse(s.replace(/\\"/g,'"'));var _cnt=parseInt(o.content,10)||0;if(_cnt<=0||o.class!=='LinkControl')return;var _lnk=o.link||'';var _cat=null;for(var _k in _IOCAT){if(_lnk.indexOf(_k)>=0){_cat=_IOCAT[_k];break;}}if(!_cat)return;var _pfx=_lnk.indexOf('input')>=0?'input':'output';var _xm=_lnk.match(/s_xID=([^&'"]+)/);if(!_xm)return;var _xid=decodeURIComponent(_xm[1]);var _flt=(_lnk.match(/filter=(\w+)/)||['','TS'])[1];
+            var _l2tid=_pfx+'_table';var _l2r=api.post(url+'/status/'+_pfx+'/get_rows?s_xID='+encodeURIComponent(_xid)+'&filter='+_flt,'table_id='+_l2tid+'&paging_info_'+_l2tid+'='+encodeURIComponent('{"start_row":0,"rows_to_show":5}'));var _streams=_td(_l2r,'tbl_data_'+_l2tid);if(_streams.length===0){var _CATLABEL={'Input-TS':'Input TS','Input-Svc':'Input Service','Out-Pkg':'Output Packager','Out-TS':'Output TS','Out-Svc':'Output Service'};var _catLabel=_CATLABEL[_cat]||_cat;var _m0=_catLabel+': '+_cnt+' alarm'+(_cnt>1?'s':'');if(_cat.indexOf('Out-')===0||_cat==='Out-Pkg'){try{var _on=api.post(url+'/service/overview/opennode2','xID='+encodeURIComponent(_xid)+'&type=S');var _svcs=[];JSON.parse(_on).forEach(function(n){var t=(n.title||'').trim();if(t&&t.indexOf('<')<0&&t.indexOf('SEARCH')<0&&_svcs.length<5)_svcs.push(t);});if(_svcs.length>0)_m0=_catLabel+' ['+_svcs.join(',')+(_svcs.length>=5?'...':'')+']'+': '+_cnt+' alarm'+(_cnt>1?'s':'');}catch(e){}}if(!_as[_m0]){_as[_m0]=true;_ap.push(_m0);}return;}
+            var _nm={};try{var _on2=api.post(url+'/service/overview/opennode2','xID='+encodeURIComponent(_xid));function _parseNode(n){var t=_h(n.title||'');var mi=t.match(/\((\d+\.\d+\.\d+\.\d+:\d+)\)/);if(mi){var nm2=t.replace(/\s*\(.*$/,'').trim();if(nm2&&mi[1])_nm[mi[1]]=nm2;}var mp=t.match(/\((?:RTP|UDP|RTMP)?\)\(:([0-9]+)\)/);if(mp){var nm3=t.replace(/\s*\(.*$/,'').trim();if(nm3&&mp[1])_nm[':'+mp[1]]=nm3;}var ms=t.match(/TS\s+ID:\d+\(:([0-9]+)\)/);if(ms){var nm4=t.replace(/\s*\(.*$/,'').trim();if(nm4&&ms[1])_nm[':'+ms[1]]=nm4;}}JSON.parse(_on2).forEach(function(n){_parseNode(n);if(n.children&&Array.isArray(n.children))n.children.forEach(_parseNode);});}catch(e){}if(_pfx==='input'){try{api.get(url+'/bitrates/input/refresh?s_xID='+encodeURIComponent(_xid)+'&filter=Service');var _nmr=api.post(url+'/bitrates/input/get_rows?s_xID='+encodeURIComponent(_xid)+'&filter=Service','table_id=bitrates_serv_input_table&paging_info_bitrates_serv_input_table='+encodeURIComponent('{"start_row":0,"rows_to_show":100}'));_t(_nmr,'tbl_data_bitrates_serv_input_table').forEach(function(nr){var nv=nr.values||[];var _ni=String(nv[2]||'').trim();var _np=String(nv[3]||'').trim();var _nn=String(nv[8]||'').trim();if(_ni&&_np&&_nn&&!_nm[_ni+':'+_np])_nm[_ni+':'+_np]=_nn;});}catch(e){}}
+            var _ms=null;for(var _si=0;_si<_streams.length&&_si<2;_si++){var _sv=_streams[_si].values||[];if(String(_sv[0]||'').indexOf('major')>=0||String(_sv[0]||'').indexOf('warning')>=0){_ms=_sv;break;}}if(!_ms)_ms=(_streams[0].values||[]);
+            var _dtxt=null;if(_ms){var _dlnk=null;_ms.forEach(function(c){if(String(c||'').indexOf('status/detail')>=0)_dlnk=String(c);});if(_dlnk){var _dxm=_dlnk.match(/s_xID=([^&'"]+)/);var _dsm=_dlnk.match(/s_type=(\w+)/);if(_dxm){var _dxid=decodeURIComponent(_dxm[1]);var _dst=_dsm?_dsm[1]:'TS';var _dfm=_dlnk.match(/filter=(\w+)/);var _dflt=_dfm?_dfm[1]:_dst;var _dtid='status_detail_table';var _dr=api.post(url+'/status/detail/get_rows?s_xID='+encodeURIComponent(_dxid)+'&s_type='+_dst+'&filter='+_dflt,'table_id='+_dtid+'&paging_info_'+_dtid+'='+encodeURIComponent('{"start_row":0,"rows_to_show":10}'));var _dts=[],_dtChk=0;_td(_dr,'tbl_data_'+_dtid).forEach(function(drow){var dv=drow.values||[];var _atype=_h(String(dv[1]||'')).replace(/<[^>]*>/g,'').trim();var _astatus=String(dv[5]||dv[4]||'');if(_atype.length>3&&_astatus.indexOf('Cleared')<0&&!_atype.startsWith('status_')&&!_atype.startsWith('fi-')){_dtChk++;if(NOISE.indexOf(_atype)<0){var _arm=_astatus.match(/Reason=([^=]+)=/);var _atxt=_arm?_atype+': '+_arm[1].trim():_atype;if(_dts.indexOf(_atxt)<0)_dts.push(_atxt);}}});if(_dts.length>0)_dtxt=_dts.slice(0,4).join(', ');else if(_dtChk>0)return;}}}
+            var _sids=[];_streams.slice(0,3).forEach(function(sr){var sv=sr.values||[];var _sip='';var _sp2=0;sv.forEach(function(c){if(typeof c==='number'&&c>=100&&c<=65534&&_sp2===0)_sp2=c;if(typeof c==='string'&&/^\d+\.\d+\.\d+\.\d+$/.test(c)&&!_sip)_sip=c;});var _key=(_sip&&_sip!=='127.0.0.1'&&_sip!=='0.0.0.0')?_sip+':'+_sp2:(_sp2?':'+_sp2:'');var _sname=_nm[_sip+':'+_sp2]||'';if(_key){var _sid=_sname?_key+' ('+_sname+')':_key;_sids.push(_sid);}});if(_streams.length>3)_sids.push('...');if(_sids.length===0&&_ms){for(var _vi=0;_vi<_ms.length;_vi++){var _vc=String(_ms[_vi]||'').trim();if(_vc.length>2&&!_vc.startsWith('status')&&!_vc.startsWith('fi-')&&_vc.indexOf('/')<0&&_vc.indexOf('?')<0&&!/^[\d\s]+$/.test(_vc)&&_vc!=='None'){_sids.push(_vc);break;}}}
+            var _sname_first='';_sids.forEach(function(sid){if(!_sname_first&&sid.indexOf('(')>=0){var _nm2=sid.match(/\(([^)]+)\)/);if(_nm2)_sname_first=_nm2[1];}});var _CATLBL={'Input-TS':'Input TS','Input-Svc':'Input Service','Out-Pkg':'Output Packager','Out-TS':'Output TS','Out-Svc':'Output Service'};var _body=_dtxt?_dtxt:(_CATLBL[_cat]||_cat)+': '+_cnt+' alarm'+(_cnt>1?'s':'');var _identifier='';if(_sids.length>0){var _s0=_sids[0];var _sm=_s0.match(/^(.+)\s+\(([^)]+)\)$/);_identifier=_sm?(_sm[2]+'('+_sm[1]+')'):_s0;}var _msg=_identifier?(_identifier+': '+_body):_body;if(!_as[_msg]){_as[_msg]=true;_ap.push(_msg);}}catch(e){}});});}catch(e){}
+            _ap=_ap.filter(function(e){var en=e.replace(/\\"/g,'"');return en.indexOf('"class":"LinkControl"')<0&&en.indexOf('"class": "LinkControl"')<0;});
+            R_alm=_ap.length>0?_ap.join('\n'):'OK';
+            var _aj=[];_ap.forEach(function(msg){var ci=msg.indexOf(': ');if(ci<0){var sid=msg.replace(/\(/g,'_').replace(/\)/g,'').replace(/[^a-zA-Z0-9.]/g,'_').replace(/_+/g,'_').replace(/^_|_$/g,'');_aj.push({id:sid,ch:msg,alarm:msg});return;}var ch=msg.substring(0,ci),alarm=msg.substring(ci+2);if(ch.indexOf('{')>=0){var _cc=ch.substring(0,ch.indexOf('{')).replace(/\s*\|?\s*$/,'').trim()||'Alarm';var _ci=_cc.replace(/\(/g,'_').replace(/\)/g,'').replace(/[^a-zA-Z0-9.]/g,'_').replace(/_+/g,'_').replace(/^_|_$/g,'');_aj.push({id:_ci,ch:_cc,alarm:msg});return;}var id=ch.replace(/\(/g,'_').replace(/\)/g,'').replace(/[^a-zA-Z0-9.]/g,'_').replace(/_+/g,'_').replace(/^_|_$/g,'');_aj.push({id:id,ch:ch,alarm:alarm});});
+            }catch(e){R_alm='ERROR: '+String(e);}
+            var R_proc='ERROR';
+            try{var _pa=[];cards.forEach(function(card){var _pe=encodeURIComponent(card),_pr=api.post(url+'/status/processing/get_rows?s_xID='+_pe,'table_id=processing_table&paging_info_processing_table='+encodeURIComponent('{"start_row":0,"rows_to_show":500}'));if(!_pr||_pr.indexOf('No Processing Alarms')>=0)return;_t(_pr,'tbl_data_processing_table').forEach(function(row){var v=row.values||[],svc=_h(v[3]),at=_h(v[4]);if(/\(\d+x\d+/.test(svc)||!svc||/^fi-/.test(svc)||/^\d+$/.test(svc))return;_pa.push(at?svc+': '+at:svc);});});if(_pa.length===0)R_proc='OK';else{var _ps={};R_proc=_pa.filter(function(a){if(_ps[a])return false;_ps[a]=true;return true;}).join(', ');};}catch(e){R_proc='ERROR: '+String(e);}
+            var R_sdi=[];
+            try{sdiNodes.forEach(function(xid,idx){var _sr=api.post(url+'/service/overview/opennode2','xID='+encodeURIComponent(xid)+'&type='),sig=0,svc='';try{var ch=JSON.parse(_sr);if(ch.length>0){var cx=ch[0].context||'';sig=(cx.indexOf('_129d')!==-1||cx.indexOf('_128d')!==-1)?1:0;svc=(ch[0].title||'').split(/[\s(]/)[0];}}catch(e){}R_sdi.push({name:'SDI'+(idx+1),port:xid,service:svc,signal:sig});});}catch(e){}
+            var R_svc={proc_bps:0,services:[]};
+            try{var _se=encodeURIComponent(procNode);api.get(url+'/bitrates/processing/refresh?s_xID='+_se+'&s_type=');var _sr2=api.post(url+'/bitrates/processing/get_rows?s_xID='+_se+'&s_type=','table_id=bitrates_processing_table&paging_info_bitrates_processing_table='+encodeURIComponent('{"start_row":0,"rows_to_show":500}'));if(_sr2){var _sv=[],_sb=0;_t(_sr2,'tbl_data_bitrates_processing_table').forEach(function(row){var v=row.values||[],nm=String(v[2]||'').trim(),cr=parseFloat(String(v[3]||'').trim())||0;if(!nm||cr<=0)return;var b=Math.round(cr*1000000);_sv.push({name:nm,bps:b});_sb+=b;});if(_sv.length>0)R_svc={proc_bps:_sb,services:_sv};}}catch(e){}
+            var R_srt={count:0,connected:0,streams:[]};
+            try{var _oe=encodeURIComponent(outCard);api.get(url+'/bitrates/output/refresh?s_xID='+_oe);var _or=api.post(url+'/bitrates/output/get_rows?s_xID='+_oe,'table_id=bitrates_serv_output_table&paging_info_bitrates_serv_output_table='+encodeURIComponent('{"start_row":0,"rows_to_show":500}'));if(_or){var _st=[];_t(_or,'tbl_data_bitrates_serv_output_table').forEach(function(row){var v=row.values||[],svc=String(v[10]||'').trim(),port=parseInt(String(v[5]||'0').trim(),10),cr=parseFloat(String(v[11]||'0').trim())||0;if(svc&&port>0)_st.push({svc:svc,port:port,bps:Math.round(cr*1000000),on:0,caller:''});});var _cr2=api.post(url+'/service/overview/opennode2','xID='+encodeURIComponent(outCard)+'&type='),_pst={};try{JSON.parse(_cr2).forEach(function(ch){if(ch.nodetype!=='TS_S')return;var t=(ch.title||'').replace(/<[^>]+>/g,''),pm=t.match(/\(:(\d+)\)/);if(!pm)return;_pst[parseInt(pm[1],10)]={on:/\bON\b/.test(t)?1:0,caller:(t.match(/Caller\s+([\d.]+)/)||[])[1]||''};});}catch(e){}var _cn=0;_st.forEach(function(s){var st=_pst[s.port]||{on:0,caller:''};s.on=st.on;s.caller=st.caller;_cn+=st.on;});R_srt={count:_st.length,connected:_cn,streams:_st};}}catch(e){}
+            try{return JSON.stringify({device_status:R_dev,alarms_detail:R_alm,alarms_json:_aj,processing_alarms:R_proc,sdi_status:R_sdi,services_bitrates:R_svc.services,srt_output:R_srt,proc_bps:R_svc.proc_bps});}
+            finally{_logout();}
+            
+          description: 'Master item: one login → fetch all monitoring data → logout. Returns combined JSON for all dependent items.'
+          timeout: 90s
+          triggers:
+            - uuid: 01f54cf485f94f6c82d14de53e1b1e4e
+              expression: 'nodata(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.data,6m)=1'
+              recovery_mode: RECOVERY_EXPRESSION
+              recovery_expression: 'nodata(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.data,6m)=0'
+              name: 'vDCM monitoring unavailable (no data > 6 min)'
+              priority: HIGH
+              description: 'vdcm.data master item has not been updated for 6+ minutes. All dependent monitoring items are stale. Check Zabbix server connectivity and vDCM device availability.'
+              manual_close: 'YES'
+        - uuid: c6e173626aa845d9981b95c36c795554
+          name: 'vDCM active alarm count'
+          type: DEPENDENT
+          key: vdcm.device.alarms
+          history: 90d
+          description: 'Number of active alarms on the vDCM device (from /load_alarm_footer device_status field).'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.alarm_count
+          master_item:
+            key: vdcm.device.status
+        - uuid: 1e0fcef739c74c66973d0909c4416752
+          name: 'vDCM device state'
+          type: DEPENDENT
+          key: vdcm.device.state
+          history: 90d
+          value_type: TEXT
+          description: 'vDCM device operational role string (e.g. "Active - Role: Standalone"). Informational only; no trigger.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.device_state
+          master_item:
+            key: vdcm.device.status
+        - uuid: 846dacb4e32547038a7290ab5000ba9f
+          name: 'vDCM device health status'
+          type: DEPENDENT
+          key: vdcm.device.status
+          history: 1h
+          value_type: TEXT
+          description: 'Logs into vDCM (61.220.40.194) and queries /load_alarm_footer. Returns JSON: {"alarm_count":0,"device_state":"Active - Role: Standalone","vdcm_state":"Active"}.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.device_status
+          master_item:
+            key: vdcm.data
+          triggers:
+            - uuid: f43635bfa2eb4e81b5b664e4082cfd65
+              expression: 'nodata(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.device.status,6m)=1'
+              name: 'vDCM: device unreachable (no data for 6 min)'
+              priority: HIGH
+              description: 'vDCM at 61.220.40.194:4431 has not returned data for 6+ minutes (3 consecutive poll failures). Check network and vDCM service.'
+        - uuid: eb7f88d83d1e4f47945178ee7153be7e
+          name: 'vDCM state'
+          type: DEPENDENT
+          key: vdcm.device.vdcm_state
+          history: 90d
+          value_type: TEXT
+          description: 'vDCM operational state string (e.g. "Active"). Sourced from /load_alarm_footer vdcm_state element.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.vdcm_state
+          master_item:
+            key: vdcm.device.status
+          triggers:
+            - uuid: 2c1abf8aac0749feaba57a8365e097f1
+              expression: 'last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.device.vdcm_state)<>"Active" and last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.device.vdcm_state)<>"unknown"'
+              name: 'vDCM: state is not Active (current: {ITEM.LASTVALUE})'
+              priority: HIGH
+              description: 'The vDCM state is not "Active" (current: {ITEM.LASTVALUE}). Device may be in fault, standby, or restarting.'
+        - uuid: c3db63d91ef04c4fafe741ecacaeb47d
+          name: 'vDCM total processing bitrate'
+          type: DEPENDENT
+          key: vdcm.proc.bitrate
+          history: 90d
+          units: bps
+          description: 'Total output bitrate across all encoding services from /bitrates/processing (EBC+TVBS+FTV+EBCF). Normal ~39.6 Mbps.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.proc_bps
+          master_item:
+            key: vdcm.data
+          triggers:
+            - uuid: 5a13e819d4864f8db6719835b2ac8f4e
+              expression: 'min(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.proc.bitrate,3m)<{$VIDEO.PROC.BITRATE.WARN} and min(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.proc.bitrate,3m)>0'
+              name: 'vDCM: total output bitrate dropped below threshold ({ITEM.LASTVALUE})'
+              priority: HIGH
+              description: 'Total processing bitrate dropped below {$VIDEO.PROC.BITRATE.WARN} bps for 3+ minutes. Normal total is ~39.6 Mbps. Threshold {$VIDEO.PROC.BITRATE.WARN} = 30 Mbps (~75%).'
+        - uuid: 7c8d9e0f1a2b4819a77c8d9e0f1a2b48
+          name: 'vDCM processing alarms (HTTP API)'
+          type: DEPENDENT
+          key: vdcm.processing.alarms
+          history: 90d
+          value_type: TEXT
+          description: 'Queries /status/processing/get_rows for Board 2 (vMFP 2, xID T_I:2:4) where SDI inputs (Kona4 SDI1-SDI4) are processed for EBC/EBCF/FTV/TVBS. Returns "OK" when no processing alarms. Returns channel name + alarm type, e.g. "EBC: TS Sync Loss" when faults exist.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.processing_alarms
+          master_item:
+            key: vdcm.data
+          triggers:
+            - uuid: 6d7e8f9a0b1c4819866d7e8f9a0b1c48
+              expression: 'last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.processing.alarms)<>"OK"'
+              name: 'vDCM: processing fault — {ITEM.LASTVALUE}'
+              priority: HIGH
+              description: 'Processing-layer fault on FTV vDCM (61.220.40.194). Affected channels: {ITEM.LASTVALUE} Source: /status/processing/get_rows for T_I:2:4 (vMFP 2 SDI inputs). Services: EBC / EBCF / FTV / TVBS (SDI1-SDI4 via Kona4 card). Investigate at https://61.220.40.194:4431 → Status > Processing.'
+        - uuid: 3a4b5c6d7e8f4819a93a4b5c6d7e8f90
+          name: 'vDCM SDI input signal status'
+          type: DEPENDENT
+          key: vdcm.sdi.status
+          history: 1h
+          value_type: TEXT
+          description: 'Queries each SDI stream node via opennode2 to detect signal presence. Returns JSON: [{"name":"SDI1","port":"T_I:2:0:*:512","service":"EBC","signal":1},...] signal=1 = SDI input active (_128d flag on this device; _129d on SPORTCAST — both are checked). signal=0 = no signal or no service assigned. SDI nodes from macro {$VDCM.SDI.NODES}. Set macro to empty to disable. LiTV_FTV_SRT: SDI1=EBC, SDI2=TVBS, SDI3=FTV, SDI4=EBCF.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.sdi_status
+          master_item:
+            key: vdcm.data
+        - uuid: dfdddd9c7c7445df9536d621d708290f
+          name: 'vDCM all service bitrates (HTTP API)'
+          type: DEPENDENT
+          key: vdcm.services.bitrates
+          history: 1h
+          value_type: TEXT
+          description: 'Logs into vDCM and queries /bitrates/processing for the processing node ({$VDCM.PROC.NODE} = T_T:2:*:*:e0). FTV returns 4 service-level rows directly (EBC/TVBS/FTV/EBCF, no profile sub-rows). Returns: {"proc_bps":39600000,"services":[{"name":"EBC","bps":9841000},...]}. Normal total ~39.6 Mbps (EBC+TVBS+FTV+EBCF each ~9.8-9.9 Mbps).'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.services_bitrates
+          master_item:
+            key: vdcm.data
+        - uuid: 60fb670da1204cbd9b06e8e8dc8e3e7e
+          name: 'vDCM active encoding service count'
+          type: DEPENDENT
+          key: vdcm.services.count
+          history: 90d
+          description: 'Number of encoding services actively returning bitrate from /bitrates/processing. Expected: 4 (EBC/TVBS/FTV/EBCF).'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var obj = JSON.parse(value);
+                  var svcs = obj.services || obj;
+                  return String(svcs.length);
+          master_item:
+            key: vdcm.services.bitrates
+        - uuid: 444b263389404f039ff040aef631707f
+          name: 'vDCM SRT connected stream count'
+          type: DEPENDENT
+          key: vdcm.srt.connected
+          history: 90d
+          description: 'Number of SRT streams with an active caller connection (ON=true + Caller IP present). Expected: {$VDCM.SRT.COUNT.MIN} = 8. Detects SRT caller disconnection immediately at next 2-minute poll, before bitrate drops to zero. Source: opennode2 stream title contains "ON" keyword and "Caller" IP.'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var obj = JSON.parse(value);
+                  var n = 0;
+                  (obj.streams || []).forEach(function(s) { if (s.on === 1) n++; });
+                  return String(n);
+          master_item:
+            key: vdcm.srt.output
+        - uuid: 5e6483d849b34dd5884f81b919e87656
+          name: 'vDCM SRT output stream count'
+          type: DEPENDENT
+          key: vdcm.srt.count
+          history: 90d
+          description: 'Number of active SRT output streams on Port 3 Mgmt (T_O:1:2). Expected: {$VDCM.SRT.COUNT.MIN} = 8 (EBC×2 + TVBS×2 + FTV×2 + EBCF×2 to both 218.211.161.8 and 211.21.3.210).'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.count
+          master_item:
+            key: vdcm.srt.output
+        - uuid: 6df3406c2cd84a89b3b690bb1652c9a6
+          name: 'vDCM SRT output stream bitrates (HTTP API)'
+          type: DEPENDENT
+          key: vdcm.srt.output
+          history: 1h
+          value_type: TEXT
+          description: 'Queries /bitrates/output for {$VDCM.OUTPUT.CARD} (T_O:1:2 = Port 3 Mgmt). Also calls opennode2 for T_O:1:2 to detect SRT caller connection state from stream title (ON/OFF + Caller IP). Returns: {"count":8,"connected":8,"streams":[{"svc":"EBC","port":26000,"bps":9836000,"on":1,"caller":"218.211.161.8"},...]} Normal: 8 SRT streams active (EBC/TVBS/FTV/EBCF × 2 destinations), all on=1. Column layout: [5]=dest_port, [10]=service_name, [11]=cur_bitrate_Mbps. Master item for vdcm.srt.count, vdcm.srt.connected, and vdcm.srt.discovery LLD.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.srt_output
+          master_item:
+            key: vdcm.data
+      discovery_rules:
+        - uuid: 7373d0c798234821912772ed17befd1b
+          name: 'vDCM active alarms (LLD)'
+          type: DEPENDENT
+          key: vdcm.alarm.discovery
+          item_prototypes:
+            - uuid: 52080d862ac14441a5d3f93dde9d6039
+              name: 'vDCM alarm: {#CH}'
+              type: DEPENDENT
+              key: 'vdcm.alarm[{#ALARM_ID}]'
+              history: 7d
+              value_type: CHAR
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - 'var d=JSON.parse(value);var aj=d.alarms_json||[];var id=''{#ALARM_ID}'';for(var i=0;i<aj.length;i++){if(aj[i].id===id)return aj[i].alarm;}return'''';'
+              master_item:
+                key: vdcm.data
+              trigger_prototypes:
+                - uuid: cb3daa5f11da45b588cb0e4c7a274b29
+                  expression: 'count(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.alarm[{#ALARM_ID}],#4,"ne","")>=4'
+                  recovery_mode: RECOVERY_EXPRESSION
+                  recovery_expression: 'count(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.alarm[{#ALARM_ID}],#6,"eq","")>=6'
+                  name: 'vDCM: {#CH}: {ITEM.LASTVALUE}'
+                  priority: AVERAGE
+                  manual_close: 'YES'
+          master_item:
+            key: vdcm.data
+          lld_macro_paths:
+            - lld_macro: '{#ALARM_ID}'
+              path: $.id
+            - lld_macro: '{#CH}'
+              path: $.ch
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.alarms_json
+              error_handler: CUSTOM_ERROR
+              error_handler_params: '[]'
+        - uuid: 4b5c6d7e8f9a4819b44b5c6d7e8f9ab5
+          name: 'vDCM SDI input signal discovery'
+          type: DEPENDENT
+          key: vdcm.sdi.discovery
+          description: 'Discovers SDI input ports from vdcm.sdi.status. Creates one signal item and trigger per SDI port. LiTV_FTV_SRT: SDI1(EBC), SDI2(TVBS), SDI3(FTV), SDI4(EBCF).'
+          item_prototypes:
+            - uuid: 4d32ca8ac414442aa90c5e7f151960cd
+              name: '{#SDINAME} ({#SDISVC}) - signal'
+              type: DEPENDENT
+              key: 'vdcm.sdi.signal[{#SDINAME}]'
+              history: 90d
+              description: 'SDI input signal status: 1=present, 0=lost. {#SDINAME} maps to service {#SDISVC} at port {#SDIPORT}.'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var arr = JSON.parse(value);
+                      var name = '{#SDINAME}';
+                      for (var i = 0; i < arr.length; i++) {
+                          if (arr[i].name === name) { return String(arr[i].signal); }
+                      }
+                      throw new Error(name + ' not found in vdcm.sdi.status response');
+              master_item:
+                key: vdcm.sdi.status
+          trigger_prototypes:
+            - uuid: aa71effcdb79405da3fed0e7e3bb690e
+              expression: 'min(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.sdi.signal[{#SDINAME}],1m)=0 and nodata(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.sdi.signal[{#SDINAME}],5m)=0 and last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.device.vdcm_state)="Active"'
+              name: '{#SDINAME} ({#SDISVC}): SDI input signal lost'
+              priority: HIGH
+              description: 'SDI input {#SDINAME} for service {#SDISVC} has had no signal for 1+ minute while vDCM is Active. Check SDI cable and source equipment at {$VDCM.URL}.'
+          master_item:
+            key: vdcm.sdi.status
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var arr = JSON.parse(value);
+                  return JSON.stringify(arr.map(function(s) {
+                      return { '{#SDINAME}': s.name, '{#SDIPORT}': s.port, '{#SDISVC}': s.service };
+                  }));
+        - uuid: a1b2c3d4e5f6481987a1b2c3d4e5f697
+          name: 'vDCM service bitrate discovery'
+          type: DEPENDENT
+          key: vdcm.service.discovery
+          description: 'Discovers encoding services from vdcm.services.bitrates JSON. Creates per-service bitrate item and three triggers automatically. Services are auto-detected: no template changes needed when channels change.'
+          item_prototypes:
+            - uuid: b2c3d4e5f6a7481988b2c3d4e5f6a798
+              name: '{#SERVICE.NAME} - bitrate'
+              type: DEPENDENT
+              key: 'vdcm.bitrate[{#SERVICE.NAME}]'
+              history: 90d
+              units: bps
+              description: 'Encoding service {#SERVICE.NAME} current output bitrate in bps.'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var obj = JSON.parse(value);
+                      var data = obj.services || obj;
+                      var name = '{#SERVICE.NAME}';
+                      for (var i = 0; i < data.length; i++) {
+                          if (data[i].name === name) { return String(data[i].bps); }
+                      }
+                      return '0'; // service absent from response = treat as crashed (bps=0)
+              master_item:
+                key: vdcm.services.bitrates
+          trigger_prototypes:
+            - uuid: c3d4e5f6a7b8481989c3d4e5f6a7b8a9
+              expression: 'min(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.bitrate[{#SERVICE.NAME}],3m)<{$VIDEO.BITRATE.MIN} and min(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.bitrate[{#SERVICE.NAME}],3m)>0 and last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.device.vdcm_state)="Active"'
+              name: '{#SERVICE.NAME}: bitrate below minimum ({ITEM.LASTVALUE})'
+              priority: HIGH
+              description: 'Service {#SERVICE.NAME} bitrate critically below {$VIDEO.BITRATE.MIN} bps for 3+ minutes.'
+            - uuid: d4e5f6a7b8c9481980d4e5f6a7b8c9b0
+              expression: 'min(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.bitrate[{#SERVICE.NAME}],3m)<{$VIDEO.BITRATE.WARN} and min(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.bitrate[{#SERVICE.NAME}],3m)>{$VIDEO.BITRATE.MIN} and last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.device.vdcm_state)="Active"'
+              name: '{#SERVICE.NAME}: bitrate is low ({ITEM.LASTVALUE})'
+              priority: AVERAGE
+              description: 'Service {#SERVICE.NAME} bitrate below warning threshold {$VIDEO.BITRATE.WARN} bps for 3+ minutes.'
+            - uuid: eae68c25bdbe4079ad7bc78c6cc76f4f
+              expression: 'nodata(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.bitrate[{#SERVICE.NAME}],5m)=1 and last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.device.vdcm_state)="Active"'
+              name: '{#SERVICE.NAME}: service missing (no data)'
+              priority: DISASTER
+              description: 'Service {#SERVICE.NAME} has not returned data for 5+ minutes while vDCM is Active. Service may be removed or crashed.'
+            - uuid: e5f6a7b8c9d0481981e5f6a7b8c9d0c1
+              expression: 'min(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.bitrate[{#SERVICE.NAME}],2m)=0 and nodata(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.bitrate[{#SERVICE.NAME}],5m)=0 and last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.device.vdcm_state)="Active"'
+              name: '{#SERVICE.NAME}: stream stopped (bitrate = 0)'
+              priority: DISASTER
+              description: 'Service {#SERVICE.NAME} bitrate has been 0 bps for 2+ minutes while vDCM is Active. Confirmed encoding outage. Note: with 2-min polling, min(2m)=0 fires on the first 0 reading — detection is immediate. Check at {$VDCM.URL} → Processing → {#SERVICE.NAME}.'
+          master_item:
+            key: vdcm.services.bitrates
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var obj = JSON.parse(value);
+                  var data = obj.services || obj;
+                  return JSON.stringify(data.map(function(s) {
+                      return { '{#SERVICE.NAME}': s.name, '{#SERVICE.TITLE}': s.name };
+                  }));
+        - uuid: 7464b40c32c945b7a85fa500fc55163a
+          name: 'vDCM SRT output stream discovery'
+          type: DEPENDENT
+          key: vdcm.srt.discovery
+          description: 'Discovers SRT output streams from vdcm.srt.output. Creates per-stream: connection state (on/off) + bitrate items with triggers. LiTV_FTV_SRT: 8 streams — EBC/TVBS/FTV/EBCF × ports 26000-26007 (2 destinations each). {#SRT.SVC}=service name, {#SRT.PORT}=listen port, {#SRT.DEST}=caller/destination IP.'
+          item_prototypes:
+            - uuid: 24dca817ac22407bb292e8c9f55418ed
+              name: '{#SRT.SVC} (:{#SRT.PORT} → {#SRT.DEST}) - SRT output bitrate'
+              type: DEPENDENT
+              key: 'vdcm.srt.bitrate[{#SRT.PORT}]'
+              history: 90d
+              units: bps
+              description: 'SRT output bitrate for service {#SRT.SVC} on port :{#SRT.PORT} to {#SRT.DEST}. Source: {$VDCM.OUTPUT.CARD}.'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var obj = JSON.parse(value);
+                      var port = parseInt('{#SRT.PORT}', 10);
+                      var streams = obj.streams || [];
+                      for (var i = 0; i < streams.length; i++) {
+                          if (streams[i].port === port) return String(streams[i].bps);
+                      }
+                      throw new Error('{#SRT.PORT} not found in vdcm.srt.output');
+              master_item:
+                key: vdcm.srt.output
+            - uuid: 21fe473d029c4ca9a645e2649f38af98
+              name: '{#SRT.SVC} (:{#SRT.PORT} → {#SRT.DEST}) - SRT caller connected'
+              type: DEPENDENT
+              key: 'vdcm.srt.on[{#SRT.PORT}]'
+              history: 90d
+              description: 'SRT caller connection state for service {#SRT.SVC} port :{#SRT.PORT}. 1 = caller {#SRT.DEST} is connected (ON in stream title). 0 = no caller connected (OFF or title missing Caller). Detects disconnection at next 2-min poll — before bitrate drops to zero.'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var obj = JSON.parse(value);
+                      var port = parseInt('{#SRT.PORT}', 10);
+                      var streams = obj.streams || [];
+                      for (var i = 0; i < streams.length; i++) {
+                          if (streams[i].port === port) return String(streams[i].on);
+                      }
+                      return '0';
+              master_item:
+                key: vdcm.srt.output
+          trigger_prototypes:
+            - uuid: 44328071d1ae4a0eb39bfb474d064da6
+              expression: 'last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.srt.on[{#SRT.PORT}])=0 and nodata(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.srt.on[{#SRT.PORT}],5m)=0 and last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.device.vdcm_state)="Active"'
+              name: '{#SRT.SVC} (:{#SRT.PORT} → {#SRT.DEST}): SRT caller disconnected'
+              priority: DISASTER
+              description: 'SRT caller for {#SRT.SVC} on port :{#SRT.PORT} (remote: {#SRT.DEST}) is not connected. The stream title changed from "ON ... (Caller {#SRT.DEST})" — content delivery to this destination has stopped. Check SRT caller at {#SRT.DEST} and network path to {$VDCM.URL} > Output > Port 3 Mgmt.'
+            - uuid: 463f625a94d74a80b93155969c970cc3
+              expression: 'min(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.srt.bitrate[{#SRT.PORT}],3m)=0 and nodata(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.srt.bitrate[{#SRT.PORT}],5m)=0 and last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.device.vdcm_state)="Active"'
+              name: '{#SRT.SVC} (:{#SRT.PORT} → {#SRT.DEST}): SRT output bitrate zero'
+              priority: AVERAGE
+              description: 'SRT output bitrate for {#SRT.SVC} on port :{#SRT.PORT} (to {#SRT.DEST}) has been 0 bps for 3+ minutes. Secondary indicator — if caller is still connected (vdcm.srt.on=1), this may indicate an encoding fault rather than network disconnection. Primary disconnection alarm: "{#SRT.SVC} (:{#SRT.PORT} → {#SRT.DEST}): SRT caller disconnected" (DISASTER). Check at {$VDCM.URL} > Output > I/O 1 > Port 3 Mgmt.'
+          master_item:
+            key: vdcm.srt.output
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var obj = JSON.parse(value);
+                  return JSON.stringify((obj.streams || []).map(function(s) {
+                      return {
+                          '{#SRT.SVC}':  s.svc,
+                          '{#SRT.PORT}': String(s.port),
+                          '{#SRT.DEST}': s.caller || ''
+                      };
+                  }));
+      macros:
+        - macro: '{$VDCM.ALARM.COUNT.MAX}'
+          value: '0'
+        - macro: '{$VDCM.INPUT.CARDS}'
+          value: 'T_I:2:0,T_I:2:1,T_I:2:2,T_I:2:3'
+          description: 'Input card xIDs for processing alarm checks. T_I:2:0~T_I:2:3 = Board 2 (vMFP 2), Kona4_1 SDI1-SDI4. These are the four SDI input ports for EBC/TVBS/FTV/EBCF. Note: T_I:2:4 does NOT exist on this device (verified 2026-06-11).'
+        - macro: '{$VDCM.OUTPUT.CARD}'
+          value: 'T_O:1:2'
+          description: 'Output node xID for Port 3 Mgmt (I/O 1, Board 1). T_O:1:2 = Port 3 Mgmt on I/O 1 (0-indexed: Port1=:0, Port3=:2, Port5=:4). Verified 2026-06: contains 8 SRT streams (EBC/TVBS/FTV/EBCF x2 destinations).'
+        - macro: '{$VDCM.PASS}'
+          type: SECRET_TEXT
+          description: 'vDCM web login password. Set per-host as Secret macro.'
+        - macro: '{$VDCM.PROC.NODE}'
+          value: 'T_T:2:*:*:e0'
+          description: 'Processing node xID for /bitrates/processing queries. T_T:2:*:*:e0 = vMFP 2 processing summary node. Verified 2026-06: returns 4 service rows (EBC/TVBS/FTV/EBCF) with cur ~9.8-9.9 Mbps each.'
+        - macro: '{$VDCM.SDI.NODES}'
+          value: 'T_I:2:0:*:512,T_I:2:1:*:513,T_I:2:2:*:514,T_I:2:3:*:515'
+          description: 'Comma-separated SDI stream xID nodes for signal monitoring. SDI1=T_I:2:0:*:512(EBC), SDI2=T_I:2:1:*:513(TVBS), SDI3=T_I:2:2:*:514(FTV), SDI4=T_I:2:3:*:515(EBCF). Verified 2026-06-11 on LiTV_FTV_SRT (61.220.40.194:4431). Set empty string to disable SDI monitoring.'
+        - macro: '{$VDCM.SRT.COUNT.MIN}'
+          value: '8'
+          description: 'Minimum expected number of active SRT output streams on Port 3 Mgmt (T_O:1:2). EBC/TVBS/FTV/EBCF × 2 destinations (218.211.161.8 + 211.21.3.210) = 8 total streams. DISASTER trigger fires if active stream count falls below this value.'
+        - macro: '{$VDCM.SVC.COUNT.MIN}'
+          value: '4'
+          description: 'Minimum expected number of encoding services. DISASTER trigger fires if fewer. EBC/TVBS/FTV/EBCF = 4.'
+        - macro: '{$VDCM.URL}'
+          value: 'https://61.220.40.194:4431'
+          description: 'vDCM web UI base URL, no trailing slash.'
+        - macro: '{$VDCM.USER}'
+          value: Administrator
+          description: 'vDCM web login username'
+        - macro: '{$VIDEO.BITRATE.MIN}'
+          value: '5000000'
+          description: 'Critical threshold in bps. Default 5,000,000 bps (5 Mbps = 50% of 10 Mbps nominal). Trigger fires when encoding is severely degraded but not stopped.'
+        - macro: '{$VIDEO.BITRATE.WARN}'
+          value: '8000000'
+          description: 'Warning threshold in bps. Default 8,000,000 bps (8 Mbps = 80% of 10 Mbps nominal). EBC/EBCF/FTV/TVBS normal range: 9.6-10.3 Mbps.'
+        - macro: '{$VIDEO.PROC.BITRATE.WARN}'
+          value: '30000000'
+          description: 'Warning threshold for total processing bitrate in bps. Default 30,000,000 bps (30 Mbps = ~75% of 39.6 Mbps nominal). Fires HIGH alert when total output drops significantly (one or more services degraded).'
+  triggers:
+    - uuid: df2b9a9517304702b4a1dc7b3426b9aa
+      expression: 'min(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.proc.bitrate,2m)=0 and nodata(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.proc.bitrate,5m)=0 and last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.device.vdcm_state)="Active"'
+      name: 'vDCM: all encoding stopped (total output = 0 bps)'
+      priority: DISASTER
+      description: 'Total processing bitrate has been 0 bps for 2+ minutes while device is Active. All services have stopped encoding.'
+    - uuid: 7129a172b32344008d56e6345149aef1
+      expression: 'min(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.services.count,3m)<{$VDCM.SVC.COUNT.MIN} and nodata(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.services.count,5m)=0 and last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.device.vdcm_state)="Active"'
+      name: 'vDCM: fewer encoding services than expected ({ITEM.LASTVALUE}<{$VDCM.SVC.COUNT.MIN})'
+      priority: DISASTER
+      description: 'Number of active encoding services below {$VDCM.SVC.COUNT.MIN} for 3+ minutes. Expected: EBC, TVBS, FTV, EBCF.'
+    - uuid: 8f23f24820e74dff942b6e2c39d33fe1
+      expression: 'last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.srt.connected)<{$VDCM.SRT.COUNT.MIN} and nodata(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.srt.connected,5m)=0 and last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.device.vdcm_state)="Active"'
+      name: 'vDCM: SRT caller disconnected ({ITEM.LASTVALUE}/{$VDCM.SRT.COUNT.MIN} streams connected)'
+      priority: DISASTER
+      description: 'One or more SRT output streams lost their caller connection (ON flag missing or no Caller IP). Stream title changes from "[SRT] EBC (1) ON ID:1 ... (Caller ...)" to "OFF" or loses Caller info. Expected {$VDCM.SRT.COUNT.MIN} connected callers (218.211.161.8 + 211.21.3.210 × 4 services). Content delivery is interrupted. Check Output > I/O 1 > Port 3 Mgmt at {$VDCM.URL}.'
+    - uuid: f24b9d0d8256470f853e1d9431126492
+      expression: 'last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.srt.count)<{$VDCM.SRT.COUNT.MIN} and nodata(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.srt.count,5m)=0 and last(/Synamedia vDCM Encoder by HTTP API - FTV/vdcm.device.vdcm_state)="Active"'
+      name: 'vDCM: SRT stream count dropped ({ITEM.LASTVALUE} < {$VDCM.SRT.COUNT.MIN})'
+      priority: HIGH
+      description: 'SRT output stream count in bitrate table dropped below {$VDCM.SRT.COUNT.MIN}. This indicates a stream was removed from vDCM configuration or the bitrate table is not returning all rows. (For caller disconnection, see vdcm.srt.connected trigger.) Check Output > I/O 1 > Port 3 Mgmt at {$VDCM.URL}.'

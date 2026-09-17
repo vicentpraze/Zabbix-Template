@@ -1,0 +1,771 @@
+zabbix_export:
+  version: '7.4'
+  dashboards:
+    - uuid: d1a2b3c4e5f6478390d1a2b3c4e5f601
+      name: Synamedia vDCM 即時監控
+      display_period: 30
+      auto_start: 'YES'
+      pages:
+        - name: ''
+          widgets:
+
+            # =====================================================================
+            # Row 1 (y=0): Active Problems — 全部 Synamedia 主機，依嚴重性排序
+            # =====================================================================
+            - type: problems
+              name: ''
+              x: 0
+              'y': 0
+              width: 36
+              height: 5
+              fields:
+                - type: INTEGER
+                  name: show
+                  value: '3'
+                - type: INTEGER
+                  name: show_opdata
+                  value: '1'
+                - type: INTEGER
+                  name: show_tags
+                  value: '3'
+                - type: INTEGER
+                  name: tag_name_format
+                  value: '0'
+                - type: INTEGER
+                  name: show_suppressed
+                  value: '0'
+                - type: INTEGER
+                  name: compact_view
+                  value: '0'
+                - type: INTEGER
+                  name: show_timeline
+                  value: '1'
+                - type: INTEGER
+                  name: sort_triggers
+                  value: '16'
+                - type: INTEGER
+                  name: severities
+                  value: '60'
+                - type: HOST
+                  name: hostids.0
+                  value:
+                    host: '民視 Synamedia 主機'
+                - type: HOST
+                  name: hostids.1
+                  value:
+                    host: '侑瑋 Synamedia 主機 -1'
+                - type: HOST
+                  name: hostids.2
+                  value:
+                    host: '侑瑋 Synamedia 主機 -2'
+                - type: HOST
+                  name: hostids.3
+                  value:
+                    host: '博斯 Synamedia 主機'
+
+            # =====================================================================
+            # Row 2 (y=5): 告警數量 — 各主機 alarm_count，綠0 / 橘1+ / 紅5+
+            # =====================================================================
+            - type: item
+              name: '民視'
+              x: 0
+              'y': 5
+              width: 9
+              height: 3
+              fields:
+                - type: ITEM
+                  name: itemid.0
+                  value:
+                    host: '民視 Synamedia 主機'
+                    key: vdcm.device.alarms
+                - type: INTEGER
+                  name: show.0
+                  value: '1'
+                - type: INTEGER
+                  name: show.2
+                  value: '1'
+                - type: INTEGER
+                  name: decimal_places
+                  value: '0'
+                - type: STRING
+                  name: description
+                  value: '告警數量'
+                - type: STRING
+                  name: thresholds.0.color
+                  value: 4CAF50
+                - type: STRING
+                  name: thresholds.0.threshold
+                  value: '0'
+                - type: STRING
+                  name: thresholds.1.color
+                  value: FF8C00
+                - type: STRING
+                  name: thresholds.1.threshold
+                  value: '1'
+                - type: STRING
+                  name: thresholds.2.color
+                  value: F44336
+                - type: STRING
+                  name: thresholds.2.threshold
+                  value: '5'
+
+            - type: item
+              name: '侑瑋 -1'
+              x: 9
+              'y': 5
+              width: 9
+              height: 3
+              fields:
+                - type: ITEM
+                  name: itemid.0
+                  value:
+                    host: '侑瑋 Synamedia 主機 -1'
+                    key: vdcm.device.alarms
+                - type: INTEGER
+                  name: show.0
+                  value: '1'
+                - type: INTEGER
+                  name: show.2
+                  value: '1'
+                - type: INTEGER
+                  name: decimal_places
+                  value: '0'
+                - type: STRING
+                  name: description
+                  value: '告警數量'
+                - type: STRING
+                  name: thresholds.0.color
+                  value: 4CAF50
+                - type: STRING
+                  name: thresholds.0.threshold
+                  value: '0'
+                - type: STRING
+                  name: thresholds.1.color
+                  value: FF8C00
+                - type: STRING
+                  name: thresholds.1.threshold
+                  value: '1'
+                - type: STRING
+                  name: thresholds.2.color
+                  value: F44336
+                - type: STRING
+                  name: thresholds.2.threshold
+                  value: '5'
+
+            - type: item
+              name: '侑瑋 -2'
+              x: 18
+              'y': 5
+              width: 9
+              height: 3
+              fields:
+                - type: ITEM
+                  name: itemid.0
+                  value:
+                    host: '侑瑋 Synamedia 主機 -2'
+                    key: vdcm.device.alarms
+                - type: INTEGER
+                  name: show.0
+                  value: '1'
+                - type: INTEGER
+                  name: show.2
+                  value: '1'
+                - type: INTEGER
+                  name: decimal_places
+                  value: '0'
+                - type: STRING
+                  name: description
+                  value: '告警數量'
+                - type: STRING
+                  name: thresholds.0.color
+                  value: 4CAF50
+                - type: STRING
+                  name: thresholds.0.threshold
+                  value: '0'
+                - type: STRING
+                  name: thresholds.1.color
+                  value: FF8C00
+                - type: STRING
+                  name: thresholds.1.threshold
+                  value: '1'
+                - type: STRING
+                  name: thresholds.2.color
+                  value: F44336
+                - type: STRING
+                  name: thresholds.2.threshold
+                  value: '5'
+
+            - type: item
+              name: '博斯'
+              x: 27
+              'y': 5
+              width: 9
+              height: 3
+              fields:
+                - type: ITEM
+                  name: itemid.0
+                  value:
+                    host: '博斯 Synamedia 主機'
+                    key: vdcm.device.alarms
+                - type: INTEGER
+                  name: show.0
+                  value: '1'
+                - type: INTEGER
+                  name: show.2
+                  value: '1'
+                - type: INTEGER
+                  name: decimal_places
+                  value: '0'
+                - type: STRING
+                  name: description
+                  value: '告警數量'
+                - type: STRING
+                  name: thresholds.0.color
+                  value: 4CAF50
+                - type: STRING
+                  name: thresholds.0.threshold
+                  value: '0'
+                - type: STRING
+                  name: thresholds.1.color
+                  value: FF8C00
+                - type: STRING
+                  name: thresholds.1.threshold
+                  value: '1'
+                - type: STRING
+                  name: thresholds.2.color
+                  value: F44336
+                - type: STRING
+                  name: thresholds.2.threshold
+                  value: '5'
+
+            # =====================================================================
+            # Row 3 (y=8): 設備狀態 / 停播頻道數
+            # 民視/博斯 顯示 vdcm_state；侑瑋 顯示 output stopped_count（綠0/紅1+）
+            # =====================================================================
+            - type: item
+              name: '民視 設備狀態'
+              x: 0
+              'y': 8
+              width: 9
+              height: 3
+              fields:
+                - type: ITEM
+                  name: itemid.0
+                  value:
+                    host: '民視 Synamedia 主機'
+                    key: vdcm.device.vdcm_state
+                - type: INTEGER
+                  name: show.0
+                  value: '1'
+                - type: INTEGER
+                  name: show.2
+                  value: '1'
+                - type: STRING
+                  name: description
+                  value: 'vDCM 狀態'
+
+            - type: item
+              name: '侑瑋 -1 停播服務數'
+              x: 9
+              'y': 8
+              width: 9
+              height: 3
+              fields:
+                - type: ITEM
+                  name: itemid.0
+                  value:
+                    host: '侑瑋 Synamedia 主機 -1'
+                    key: vdcm.output.stopped_count
+                - type: INTEGER
+                  name: show.0
+                  value: '1'
+                - type: INTEGER
+                  name: show.2
+                  value: '1'
+                - type: INTEGER
+                  name: decimal_places
+                  value: '0'
+                - type: STRING
+                  name: description
+                  value: '停播服務數 (0=全正常)'
+                - type: STRING
+                  name: thresholds.0.color
+                  value: 4CAF50
+                - type: STRING
+                  name: thresholds.0.threshold
+                  value: '0'
+                - type: STRING
+                  name: thresholds.1.color
+                  value: F44336
+                - type: STRING
+                  name: thresholds.1.threshold
+                  value: '1'
+
+            - type: item
+              name: '侑瑋 -2 停播服務數'
+              x: 18
+              'y': 8
+              width: 9
+              height: 3
+              fields:
+                - type: ITEM
+                  name: itemid.0
+                  value:
+                    host: '侑瑋 Synamedia 主機 -2'
+                    key: vdcm.output.stopped_count
+                - type: INTEGER
+                  name: show.0
+                  value: '1'
+                - type: INTEGER
+                  name: show.2
+                  value: '1'
+                - type: INTEGER
+                  name: decimal_places
+                  value: '0'
+                - type: STRING
+                  name: description
+                  value: '停播服務數 (0=全正常)'
+                - type: STRING
+                  name: thresholds.0.color
+                  value: 4CAF50
+                - type: STRING
+                  name: thresholds.0.threshold
+                  value: '0'
+                - type: STRING
+                  name: thresholds.1.color
+                  value: F44336
+                - type: STRING
+                  name: thresholds.1.threshold
+                  value: '1'
+
+            - type: item
+              name: '博斯 設備狀態'
+              x: 27
+              'y': 8
+              width: 9
+              height: 3
+              fields:
+                - type: ITEM
+                  name: itemid.0
+                  value:
+                    host: '博斯 Synamedia 主機'
+                    key: vdcm.device.vdcm_state
+                - type: INTEGER
+                  name: show.0
+                  value: '1'
+                - type: INTEGER
+                  name: show.2
+                  value: '1'
+                - type: STRING
+                  name: description
+                  value: 'vDCM 狀態'
+
+            # =====================================================================
+            # Row 4 (y=11): 告警詳情 / 處理層告警 — 目前最新告警文字
+            # =====================================================================
+            - type: item
+              name: '民視 告警詳情'
+              x: 0
+              'y': 11
+              width: 9
+              height: 4
+              fields:
+                - type: ITEM
+                  name: itemid.0
+                  value:
+                    host: '民視 Synamedia 主機'
+                    key: vdcm.alarms.detail
+                - type: INTEGER
+                  name: show.0
+                  value: '1'
+                - type: INTEGER
+                  name: show.2
+                  value: '1'
+                - type: STRING
+                  name: description
+                  value: '設備告警詳情 (OK=無異常)'
+
+            - type: item
+              name: '侑瑋 -1 處理告警'
+              x: 9
+              'y': 11
+              width: 9
+              height: 4
+              fields:
+                - type: ITEM
+                  name: itemid.0
+                  value:
+                    host: '侑瑋 Synamedia 主機 -1'
+                    key: vdcm.processing.alarms
+                - type: INTEGER
+                  name: show.0
+                  value: '1'
+                - type: INTEGER
+                  name: show.2
+                  value: '1'
+                - type: STRING
+                  name: description
+                  value: '頻道處理告警 (OK=無異常)'
+
+            - type: item
+              name: '侑瑋 -2 處理告警'
+              x: 18
+              'y': 11
+              width: 9
+              height: 4
+              fields:
+                - type: ITEM
+                  name: itemid.0
+                  value:
+                    host: '侑瑋 Synamedia 主機 -2'
+                    key: vdcm.processing.alarms
+                - type: INTEGER
+                  name: show.0
+                  value: '1'
+                - type: INTEGER
+                  name: show.2
+                  value: '1'
+                - type: STRING
+                  name: description
+                  value: '頻道處理告警 (OK=無異常)'
+
+            - type: item
+              name: '博斯 告警詳情'
+              x: 27
+              'y': 11
+              width: 9
+              height: 4
+              fields:
+                - type: ITEM
+                  name: itemid.0
+                  value:
+                    host: '博斯 Synamedia 主機'
+                    key: vdcm.alarms.detail
+                - type: INTEGER
+                  name: show.0
+                  value: '1'
+                - type: INTEGER
+                  name: show.2
+                  value: '1'
+                - type: STRING
+                  name: description
+                  value: '設備告警詳情 (OK=無異常)'
+
+            # =====================================================================
+            # Row 5 (y=15): Bitrate 歷史趨勢圖
+            # 民視 4 頻道 (EBC/TVBS/FTV/EBCF) — 正常各約 9.8 Mbps
+            # 博斯 4 頻道 (SprtGlf1/SprtGlf2/SprtTns/SprtUL) — 正常各約 9 Mbps
+            # =====================================================================
+            - type: svggraph
+              name: '民視 各頻道 Bitrate (bps)'
+              x: 0
+              'y': 15
+              width: 18
+              height: 8
+              fields:
+                # Dataset 0: EBC (紅)
+                - type: INTEGER
+                  name: ds.0.type
+                  value: '0'
+                - type: STRING
+                  name: ds.0.color
+                  value: E53935
+                - type: STRING
+                  name: ds.0.label
+                  value: EBC
+                - type: HOST
+                  name: ds.0.hosts.0
+                  value:
+                    host: '民視 Synamedia 主機'
+                - type: ITEM
+                  name: ds.0.items.0
+                  value:
+                    host: '民視 Synamedia 主機'
+                    key: 'vdcm.bitrate[EBC]'
+                - type: INTEGER
+                  name: ds.0.calc_fnc
+                  value: '2'
+                - type: INTEGER
+                  name: ds.0.fill
+                  value: '3'
+                - type: INTEGER
+                  name: ds.0.missing_data
+                  value: '2'
+                - type: INTEGER
+                  name: ds.0.width
+                  value: '2'
+                # Dataset 1: TVBS (藍)
+                - type: INTEGER
+                  name: ds.1.type
+                  value: '0'
+                - type: STRING
+                  name: ds.1.color
+                  value: 1E88E5
+                - type: STRING
+                  name: ds.1.label
+                  value: TVBS
+                - type: HOST
+                  name: ds.1.hosts.0
+                  value:
+                    host: '民視 Synamedia 主機'
+                - type: ITEM
+                  name: ds.1.items.0
+                  value:
+                    host: '民視 Synamedia 主機'
+                    key: 'vdcm.bitrate[TVBS]'
+                - type: INTEGER
+                  name: ds.1.calc_fnc
+                  value: '2'
+                - type: INTEGER
+                  name: ds.1.fill
+                  value: '3'
+                - type: INTEGER
+                  name: ds.1.missing_data
+                  value: '2'
+                - type: INTEGER
+                  name: ds.1.width
+                  value: '2'
+                # Dataset 2: FTV (綠)
+                - type: INTEGER
+                  name: ds.2.type
+                  value: '0'
+                - type: STRING
+                  name: ds.2.color
+                  value: 43A047
+                - type: STRING
+                  name: ds.2.label
+                  value: FTV
+                - type: HOST
+                  name: ds.2.hosts.0
+                  value:
+                    host: '民視 Synamedia 主機'
+                - type: ITEM
+                  name: ds.2.items.0
+                  value:
+                    host: '民視 Synamedia 主機'
+                    key: 'vdcm.bitrate[FTV]'
+                - type: INTEGER
+                  name: ds.2.calc_fnc
+                  value: '2'
+                - type: INTEGER
+                  name: ds.2.fill
+                  value: '3'
+                - type: INTEGER
+                  name: ds.2.missing_data
+                  value: '2'
+                - type: INTEGER
+                  name: ds.2.width
+                  value: '2'
+                # Dataset 3: EBCF (橙)
+                - type: INTEGER
+                  name: ds.3.type
+                  value: '0'
+                - type: STRING
+                  name: ds.3.color
+                  value: FB8C00
+                - type: STRING
+                  name: ds.3.label
+                  value: EBCF
+                - type: HOST
+                  name: ds.3.hosts.0
+                  value:
+                    host: '民視 Synamedia 主機'
+                - type: ITEM
+                  name: ds.3.items.0
+                  value:
+                    host: '民視 Synamedia 主機'
+                    key: 'vdcm.bitrate[EBCF]'
+                - type: INTEGER
+                  name: ds.3.calc_fnc
+                  value: '2'
+                - type: INTEGER
+                  name: ds.3.fill
+                  value: '3'
+                - type: INTEGER
+                  name: ds.3.missing_data
+                  value: '2'
+                - type: INTEGER
+                  name: ds.3.width
+                  value: '2'
+                # Graph display settings
+                - type: INTEGER
+                  name: show.0
+                  value: '1'
+                - type: INTEGER
+                  name: show.1
+                  value: '1'
+                - type: INTEGER
+                  name: show.2
+                  value: '1'
+                - type: INTEGER
+                  name: legend_lines_mode
+                  value: '1'
+                - type: INTEGER
+                  name: legend_columns
+                  value: '4'
+                - type: INTEGER
+                  name: righty
+                  value: '0'
+                - type: STRING
+                  name: lefty_min
+                  value: '0'
+                - type: INTEGER
+                  name: lefty_units
+                  value: '0'
+
+            - type: svggraph
+              name: '博斯 各頻道 Bitrate (bps)'
+              x: 18
+              'y': 15
+              width: 18
+              height: 8
+              fields:
+                # Dataset 0: SprtGlf1 (紅)
+                - type: INTEGER
+                  name: ds.0.type
+                  value: '0'
+                - type: STRING
+                  name: ds.0.color
+                  value: E53935
+                - type: STRING
+                  name: ds.0.label
+                  value: SprtGlf1
+                - type: HOST
+                  name: ds.0.hosts.0
+                  value:
+                    host: '博斯 Synamedia 主機'
+                - type: ITEM
+                  name: ds.0.items.0
+                  value:
+                    host: '博斯 Synamedia 主機'
+                    key: 'vdcm.bitrate[SprtGlf1]'
+                - type: INTEGER
+                  name: ds.0.calc_fnc
+                  value: '2'
+                - type: INTEGER
+                  name: ds.0.fill
+                  value: '3'
+                - type: INTEGER
+                  name: ds.0.missing_data
+                  value: '2'
+                - type: INTEGER
+                  name: ds.0.width
+                  value: '2'
+                # Dataset 1: SprtGlf2 (藍)
+                - type: INTEGER
+                  name: ds.1.type
+                  value: '0'
+                - type: STRING
+                  name: ds.1.color
+                  value: 1E88E5
+                - type: STRING
+                  name: ds.1.label
+                  value: SprtGlf2
+                - type: HOST
+                  name: ds.1.hosts.0
+                  value:
+                    host: '博斯 Synamedia 主機'
+                - type: ITEM
+                  name: ds.1.items.0
+                  value:
+                    host: '博斯 Synamedia 主機'
+                    key: 'vdcm.bitrate[SprtGlf2]'
+                - type: INTEGER
+                  name: ds.1.calc_fnc
+                  value: '2'
+                - type: INTEGER
+                  name: ds.1.fill
+                  value: '3'
+                - type: INTEGER
+                  name: ds.1.missing_data
+                  value: '2'
+                - type: INTEGER
+                  name: ds.1.width
+                  value: '2'
+                # Dataset 2: SprtTns (綠)
+                - type: INTEGER
+                  name: ds.2.type
+                  value: '0'
+                - type: STRING
+                  name: ds.2.color
+                  value: 43A047
+                - type: STRING
+                  name: ds.2.label
+                  value: SprtTns
+                - type: HOST
+                  name: ds.2.hosts.0
+                  value:
+                    host: '博斯 Synamedia 主機'
+                - type: ITEM
+                  name: ds.2.items.0
+                  value:
+                    host: '博斯 Synamedia 主機'
+                    key: 'vdcm.bitrate[SprtTns]'
+                - type: INTEGER
+                  name: ds.2.calc_fnc
+                  value: '2'
+                - type: INTEGER
+                  name: ds.2.fill
+                  value: '3'
+                - type: INTEGER
+                  name: ds.2.missing_data
+                  value: '2'
+                - type: INTEGER
+                  name: ds.2.width
+                  value: '2'
+                # Dataset 3: SprtUL (橙)
+                - type: INTEGER
+                  name: ds.3.type
+                  value: '0'
+                - type: STRING
+                  name: ds.3.color
+                  value: FB8C00
+                - type: STRING
+                  name: ds.3.label
+                  value: SprtUL
+                - type: HOST
+                  name: ds.3.hosts.0
+                  value:
+                    host: '博斯 Synamedia 主機'
+                - type: ITEM
+                  name: ds.3.items.0
+                  value:
+                    host: '博斯 Synamedia 主機'
+                    key: 'vdcm.bitrate[SprtUL]'
+                - type: INTEGER
+                  name: ds.3.calc_fnc
+                  value: '2'
+                - type: INTEGER
+                  name: ds.3.fill
+                  value: '3'
+                - type: INTEGER
+                  name: ds.3.missing_data
+                  value: '2'
+                - type: INTEGER
+                  name: ds.3.width
+                  value: '2'
+                # Graph display settings
+                - type: INTEGER
+                  name: show.0
+                  value: '1'
+                - type: INTEGER
+                  name: show.1
+                  value: '1'
+                - type: INTEGER
+                  name: show.2
+                  value: '1'
+                - type: INTEGER
+                  name: legend_lines_mode
+                  value: '1'
+                - type: INTEGER
+                  name: legend_columns
+                  value: '4'
+                - type: INTEGER
+                  name: righty
+                  value: '0'
+                - type: STRING
+                  name: lefty_min
+                  value: '0'
+                - type: INTEGER
+                  name: lefty_units
+                  value: '0'

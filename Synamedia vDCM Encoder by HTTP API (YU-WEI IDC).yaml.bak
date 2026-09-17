@@ -1,0 +1,2637 @@
+zabbix_export:
+  version: '7.4'
+  template_groups:
+    - uuid: c7691cb0ae02412a87bcda2e1db5184c
+      name: 'Templates/Network devices'
+  templates:
+    - uuid: 1f95f88f2d0941818b184325e2bcd53d
+      template: 'Synamedia vDCM Encoder by HTTP API - YU-WEI IDC'
+      name: 'Synamedia vDCM Encoder by HTTP API (YU-WEI IDC)'
+      description: |
+        Synamedia vDCM HTTP API monitor for YU-WEI IDC (litv_tran1/tran2).
+        Output bitrate: LLD via /service/overview/opennode2 (nodetype=S, {$VDCM.PROC.NODE}). Input bitrate: LLD via /bitrates/input/refresh + get_rows ({$VDCM.INPUT.CARDS}). Alarms: /status/alarms/get_rows + /status/processing/get_rows (background noise filtered). Device health: /load_alarm_footer → alarm_count, device_state, vdcm_state.
+      vendor:
+        name: LiTV
+        version: 7.4.11
+      groups:
+        - name: 'Templates/Network devices'
+      items:
+        - uuid: b3c4d5e6f7a8491083b3c4d5e6f7a8b4
+          name: 'vDCM device alarm details (non-background)'
+          type: SCRIPT
+          key: vdcm.alarms.detail
+          delay: 2m
+          history: 90d
+          value_type: TEXT
+          params: |
+var url = '{$VDCM.URL}'.replace(/\/+$/, '');
+var user = '{$VDCM.USER}';
+var pass = '{$VDCM.PASS}';
+var nodeKey = '{$VDCM.PROC.NODE}';
+var excludeRaw = '{$VDCM.PROC.EXCLUDE}';
+var excludeList = excludeRaw ? excludeRaw.split(',').map(function(s){ return s.trim().toLowerCase(); }).filter(Boolean) : [];
+
+if (!url || url.indexOf('http') !== 0) {
+    throw new Error('Invalid {$VDCM.URL}: "' + url + '". Set https://hostname[:port] in host macros.');
+}
+
+// Step 1: Login — POST /login_handler?came_from=/ → HTTP 302 + Set-Cookie
+var login = new HttpRequest();
+try { login.setopt(64, 0); } catch(e) {}  // CURLOPT_SSL_VERIFYPEER
+try { login.setopt(81, 0); } catch(e) {}  // CURLOPT_SSL_VERIFYHOST
+try { login.setopt(52, 0); } catch(e) {}  // CURLOPT_FOLLOWLOCATION: don't follow 302
+login.addHeader('Content-Type: application/x-www-form-urlencoded');
+login.post(
+    url + '/login_handler?came_from=%2F',
+    'login=' + encodeURIComponent(user) +
+    '&password=' + encodeURIComponent(pass) +
+    '&login_button=Login'
+);
+var loginCode = login.getStatus();
+
+// Extract cookies — getHeaders(false) returns object in Zabbix 6.0+;
+// fallback parses raw string for older versions or edge cases.
+var cookies = [];
+try {
+    var hdrs = login.getHeaders(false);
+    if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+        Object.keys(hdrs).forEach(function(k) {
+            if (k.toLowerCase() === 'set-cookie') {
+                var v = hdrs[k];
+                (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                    var p = c.split(';')[0].trim();
+                    if (p) cookies.push(p);
+                });
+            }
+        });
+    }
+} catch(e) {}
+if (cookies.length === 0) {
+    // Fallback: parse raw header string
+    try {
+        var raw = login.getHeaders(true);
+        if (typeof raw !== 'string') raw = String(raw);
+        (raw.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+            var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+            if (p) cookies.push(p);
+        });
+    } catch(e) {}
+}
+if (cookies.length === 0) {
+    throw new Error('Login failed (HTTP ' + loginCode + '). No cookies. URL=' + url + ' user=' + user + '. Set {$VDCM.URL}/{$VDCM.PASS} in host macros.');
+}
+
+// Step 2: Query encoding services tree
+var api = new HttpRequest();
+try { api.setopt(64, 0); } catch(e) {}
+try { api.setopt(81, 0); } catch(e) {}
+api.addHeader('Content-Type: application/x-www-form-urlencoded');
+api.addHeader('Cookie: ' + cookies.join('; '));
+var result = api.post(
+    url + '/service/overview/opennode2',
+    'xID=' + encodeURIComponent(nodeKey) + '&type=S'
+);
+
+if (!result) {
+    throw new Error('vDCM opennode2 empty response. Check {$VDCM.PROC.NODE}: "' + nodeKey + '".');
+}
+
+var data = JSON.parse(result);
+var services = [];
+data.forEach(function(item) {
+    if (item.nodetype === 'S') {
+        // tooltip format: "ServiceName\ncur: 9.8 Mbps\nmax: ..."
+        var m = (item.tooltip || '').match(/cur:\s*([\d.]+)/);
+        var bps = m ? Math.round(parseFloat(m[1]) * 1000000) : 0;
+        // Extract short name (first word before space or parenthesis)
+        var name = (item.title || '').split(/[\s(]/)[0];
+        // Skip services matching {$VDCM.PROC.EXCLUDE} (e.g. RTMP push sources)
+        var nameLow = name.toLowerCase();
+        if (excludeList.some(function(ex) { return nameLow.indexOf(ex) >= 0; })) { return; }
+        services.push({ name: name, bps: bps, title: item.title || name });
+    }
+});
+
+if (services.length === 0) {
+    throw new Error('No S-type services found under node: "' + nodeKey +
+        '". Try a different {$VDCM.PROC.NODE} value (e.g. T_T:2:*:*:*:*:e0).');
+}
+
+try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+return JSON.stringify(services);
+var url  = '{$VDCM.URL}'.replace(/\/+$/, '');
+var user = '{$VDCM.USER}';
+var pass = '{$VDCM.PASS}';
+var cards = '{$VDCM.PROC.CARDS}'.split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+
+// Login — POST /login_handler?came_from=/ → HTTP 302 + Set-Cookie
+var login = new HttpRequest();
+try { login.setopt(64, 0); } catch(e) {}
+try { login.setopt(81, 0); } catch(e) {}
+try { login.setopt(52, 0); } catch(e) {}
+login.addHeader('Content-Type: application/x-www-form-urlencoded');
+login.post(
+    url + '/login_handler?came_from=%2F',
+    'login=' + encodeURIComponent(user) +
+    '&password=' + encodeURIComponent(pass) +
+    '&login_button=Login'
+);
+var loginCode = login.getStatus();
+
+var cookies = [];
+try {
+    var hdrs = login.getHeaders(false);
+    if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+        Object.keys(hdrs).forEach(function(k) {
+            if (k.toLowerCase() === 'set-cookie') {
+                var v = hdrs[k];
+                (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                    var p = c.split(';')[0].trim();
+                    if (p) cookies.push(p);
+                });
+            }
+        });
+    }
+} catch(e) {}
+if (cookies.length === 0) {
+    try {
+        var rawHdr = login.getHeaders(true);
+        if (typeof rawHdr !== 'string') rawHdr = String(rawHdr);
+        (rawHdr.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+            var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+            if (p) cookies.push(p);
+        });
+    } catch(e) {}
+}
+if (cookies.length === 0) {
+    throw new Error('Login failed (HTTP ' + loginCode + '). Check {$VDCM.URL}/{$VDCM.USER}/{$VDCM.PASS}.');
+}
+
+var cookieHdr = cookies.join('; ');
+
+// Noise alarm types to suppress — permanent background on VBR/RTMP streams.
+// PTS Discontinuity: VBR RTMP bitrate fluctuations (Quality class, always present).
+// NOTE: TS Stream Loss / UDP Stream Loss intentionally NOT suppressed here.
+// Empty port slot alarms are already filtered by the service-name check above
+// (empty slots have no service name → skipped by the !svc guard).
+// Keeping TS/UDP Stream Loss active ensures real RTMP source failures
+// (source disconnects on named channels) DO trigger this alarm.
+var NOISE_ALARMS = ['PTS Discontinuity'];
+
+function isNoise(alarmName) {
+    for (var i = 0; i < NOISE_ALARMS.length; i++) {
+        if (alarmName.indexOf(NOISE_ALARMS[i]) >= 0) return true;
+    }
+    try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+    return false;
+}
+
+function stripHtml(s) { return String(s || '').replace(/<[^>]+>/g, '').trim(); }
+
+// Fetch detail alarms for a service xID; returns array of non-noise alarm names.
+function getRealAlarms(xid) {
+    var det = new HttpRequest();
+    try { det.setopt(64, 0); } catch(e) {}
+    try { det.setopt(81, 0); } catch(e) {}
+    det.addHeader('Content-Type: application/x-www-form-urlencoded');
+    det.addHeader('Cookie: ' + cookieHdr);
+    var dresp = det.post(
+        url + '/status/detail/get_rows?s_xID=' + encodeURIComponent(xid) + '&s_type=S&filter=Service',
+        'table_id=status_detail_table&paging_info_status_detail_table=' +
+        encodeURIComponent('{"start_row":0,"rows_to_show":50}')
+    );
+    if (!dresp) return ['unknown'];
+    var dm = dresp.indexOf("tbl_data_status_detail_table='");
+    if (dm < 0) return [];
+    var ds = dm + "tbl_data_status_detail_table='".length;
+    var de = dresp.indexOf("';", ds);
+    if (de < 0) return [];
+    var denc = dresp.substring(ds, de)
+        .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+        .replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+        .replace(/\\'/g, "'");
+    var drows;
+    try { drows = JSON.parse(denc); } catch(e) { return ['parse_err']; }
+    var real = [];
+    drows.forEach(function(dr) {
+        var dv = dr.values || [];
+        // v[0]=severity, v[1]=alarm name, v[3]=status(Active/Cleared)
+        var aname = stripHtml(dv[1]);
+        var astatus = stripHtml(dv[3]);
+        if (!aname || /^fi-/.test(aname)) return;
+        if (astatus && astatus.indexOf('Cleared') >= 0) return;
+        if (isNoise(aname)) return;
+        real.push(aname);
+    });
+    try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+    return real;
+}
+
+var allAlarms = [];
+
+cards.forEach(function(card) {
+    var api = new HttpRequest();
+    try { api.setopt(64, 0); } catch(e) {}
+    try { api.setopt(81, 0); } catch(e) {}
+    api.addHeader('Content-Type: application/x-www-form-urlencoded');
+    api.addHeader('Cookie: ' + cookieHdr);
+    var resp = api.post(
+        url + '/status/processing/get_rows?s_xID=' + encodeURIComponent(card),
+        'table_id=processing_table&paging_info_processing_table=' +
+        encodeURIComponent('{"start_row":0,"rows_to_show":500}')
+    );
+    if (!resp) return;
+    if (resp.indexOf('No Processing Alarms') >= 0) return;
+
+    var marker = "tbl_data_processing_table='";
+    var idx = resp.indexOf(marker);
+    if (idx < 0) return;
+    var start = idx + marker.length;
+    var end = resp.indexOf("';", start);
+    if (end < 0) return;
+
+    var encoded = resp.substring(start, end);
+    var decoded = encoded
+        .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+        .replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+
+    var rows;
+    try { rows = JSON.parse(decoded); } catch(e) { return; }
+
+    // vDCM processing overview table columns:
+    // v[0]=severity class, v[1]=board(vMFP 2), v[2]=count,
+    // v[3]=service name, v[4]=count(dup), v[5]=fi-summary icon, v[6]=detail URL
+    rows.forEach(function(row) {
+        var v = row.values || [];
+        var svc = stripHtml(v[3]);
+        // Skip output-level rows like "DayStarMain (1920x1080p29.97 @ 5000 kbps)"
+        if (/\(\d+x\d+/.test(svc)) return;
+        // Skip icon/empty/pure-number cells
+        if (!svc || /^fi-/.test(svc) || /^\d+$/.test(svc)) return;
+
+        // Extract detail xID from v[6] URL: ?s_xID=T_T:2:65534:*:40:1&...
+        var detailUrl = stripHtml(v[6]);
+        var xidMatch = detailUrl.match(/[?&]s_xID=([^&]+)/);
+        if (!xidMatch) {
+            // No detail URL available — report service name only
+            allAlarms.push(svc);
+            return;
+        }
+        var xid = decodeURIComponent(xidMatch[1]);
+        var realAlarms = getRealAlarms(xid);
+        if (realAlarms.length === 0) return; // all noise, suppress
+        allAlarms.push(svc + ': ' + realAlarms.join(', '));
+    });
+});
+
+if (allAlarms.length === 0) return 'OK';
+var seen = {};
+var unique = allAlarms.filter(function(a) {
+    if (seen[a]) return false;
+    seen[a] = true;
+    try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+    return true;
+});
+try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+return unique.join(' | ');
+var url  = '{$VDCM.URL}'.replace(/\/+$/, '');
+var user = '{$VDCM.USER}';
+var pass = '{$VDCM.PASS}';
+var card = '{$VDCM.OUTPUT.CARD}';
+
+if (!url || url.indexOf('http') !== 0) {
+    throw new Error('Invalid {$VDCM.URL}: "' + url + '"');
+}
+
+var login = new HttpRequest();
+try { login.setopt(64, 0); } catch(e) {}
+try { login.setopt(81, 0); } catch(e) {}
+try { login.setopt(52, 0); } catch(e) {}
+login.addHeader('Content-Type: application/x-www-form-urlencoded');
+login.post(
+    url + '/login_handler?came_from=%2F',
+    'login=' + encodeURIComponent(user) +
+    '&password=' + encodeURIComponent(pass) +
+    '&login_button=Login'
+);
+var loginCode = login.getStatus();
+
+var cookies = [];
+try {
+    var hdrs = login.getHeaders(false);
+    if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+        Object.keys(hdrs).forEach(function(k) {
+            if (k.toLowerCase() === 'set-cookie') {
+                var v = hdrs[k];
+                (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                    var p = c.split(';')[0].trim();
+                    if (p) cookies.push(p);
+                });
+            }
+        });
+    }
+} catch(e) {}
+if (cookies.length === 0) {
+    try {
+        var raw = login.getHeaders(true);
+        if (typeof raw !== 'string') raw = String(raw);
+        (raw.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+            var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+            if (p) cookies.push(p);
+        });
+    } catch(e) {}
+}
+if (cookies.length === 0) {
+    throw new Error('Login failed (HTTP ' + loginCode + '). Check {$VDCM.URL}/{$VDCM.PASS}.');
+}
+
+var api = new HttpRequest();
+try { api.setopt(64, 0); } catch(e) {}
+try { api.setopt(81, 0); } catch(e) {}
+api.addHeader('Content-Type: application/x-www-form-urlencoded');
+api.addHeader('Cookie: ' + cookies.join('; '));
+var result = api.post(
+    url + '/service/overview/opennode2',
+    'xID=' + encodeURIComponent(card)
+);
+
+if (!result) {
+    throw new Error('Port 5 opennode2 empty response. Check {$VDCM.OUTPUT.CARD}: "' + card + '".');
+}
+
+var data = JSON.parse(result);
+var streams = [];
+data.forEach(function(item) {
+    // TS_S  = SRT output stream (bitrate in tooltip)
+    // TS_S_P = SRT passthrough stream (no tooltip cur, but has ON/OFF in title)
+    var isStream = item.nodetype === 'TS_S' || item.nodetype === 'TS_S_P';
+    if (isStream) {
+        var m = (item.tooltip || '').match(/cur:\s*([\d.]+)/);
+        var bps = m ? Math.round(parseFloat(m[1]) * 1000000) : 0;
+        // Extract name: everything before the first " ("
+        var sp = (item.title || '').indexOf(' (');
+        var name = sp >= 0 ? item.title.substring(0, sp) : (item.title || 'unknown');
+        // ON=1 if title contains " ON " (e.g. "TVBSN SRT (1) ON ID:1...")
+        var on = (item.title || '').indexOf(' ON ') >= 0 ? 1 : 0;
+        streams.push({ name: name, bps: bps, on: on });
+    }
+});
+
+if (streams.length === 0) {
+    throw new Error('No TS_S/TS_S_P streams found on Port 5 (' + card + '). Verify card xID or stream type.');
+}
+
+try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+return JSON.stringify(streams);
+var url = '{$VDCM.URL}'.replace(/\/+$/, '');
+var user = '{$VDCM.USER}';
+var pass = '{$VDCM.PASS}';
+var cards = '{$VDCM.INPUT.CARDS}'.split(',').map(function(s){return s.trim();}).filter(Boolean);
+
+if (!url || url.indexOf('http') !== 0) {
+    throw new Error('Invalid {$VDCM.URL}: "' + url + '". Set https://hostname[:port] in host macros.');
+}
+if (cards.length === 0) {
+    throw new Error('No input cards configured. Set {$VDCM.INPUT.CARDS} (e.g. T_I:1:4,T_I:1:65532).');
+}
+
+// Login — POST /login_handler?came_from=/ → HTTP 302 + Set-Cookie
+var login = new HttpRequest();
+try { login.setopt(64, 0); } catch(e) {}  // CURLOPT_SSL_VERIFYPEER
+try { login.setopt(81, 0); } catch(e) {}  // CURLOPT_SSL_VERIFYHOST
+try { login.setopt(52, 0); } catch(e) {}  // CURLOPT_FOLLOWLOCATION: don't follow 302
+login.addHeader('Content-Type: application/x-www-form-urlencoded');
+login.post(
+    url + '/login_handler?came_from=%2F',
+    'login=' + encodeURIComponent(user) +
+    '&password=' + encodeURIComponent(pass) +
+    '&login_button=Login'
+);
+var loginCode = login.getStatus();
+
+var cookies = [];
+try {
+    var hdrs = login.getHeaders(false);
+    if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+        Object.keys(hdrs).forEach(function(k) {
+            if (k.toLowerCase() === 'set-cookie') {
+                var v = hdrs[k];
+                (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                    var p = c.split(';')[0].trim();
+                    if (p) cookies.push(p);
+                });
+            }
+        });
+    }
+} catch(e) {}
+if (cookies.length === 0) {
+    try {
+        var raw = login.getHeaders(true);
+        if (typeof raw !== 'string') raw = String(raw);
+        (raw.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+            var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+            if (p) cookies.push(p);
+        });
+    } catch(e) {}
+}
+if (cookies.length === 0) {
+    throw new Error('Login failed (HTTP ' + loginCode + '). No cookies. URL=' + url + ' user=' + user + '. Check {$VDCM.URL}/{$VDCM.PASS}.');
+}
+
+var cookieHdr = cookies.join('; ');
+var allInputs = [];
+var seenKeys = {};
+
+// Auto-name: query opennode2 service tree to resolve "Program NNN" by SID.
+// Builds a map of SID → channel name for SIDs that appear exactly once in the tree
+// (unique SIDs are unambiguous; SID=1 often appears in many separate TS streams so is excluded).
+var autoSidMap = {};
+var procBitrate = {};  // Processing service name → kbps (guard fallback for ABR channels)
+try {
+    var procNode = '{$VDCM.PROC.NODE}';
+    var svcReq = new HttpRequest();
+    try { svcReq.setopt(64, 0); } catch(e) {}
+    try { svcReq.setopt(81, 0); } catch(e) {}
+    svcReq.addHeader('Content-Type: application/x-www-form-urlencoded');
+    svcReq.addHeader('Cookie: ' + cookieHdr);
+    var svcResp = svcReq.post(
+        url + '/service/overview/opennode2',
+        'xID=' + encodeURIComponent(procNode) + '&type=S'
+    );
+    var svcNodes = JSON.parse(svcResp);
+    // Count occurrences of each SID across all service nodes
+    var sidCount = {};
+    svcNodes.forEach(function(n) {
+        var m = (n.title || '').match(/\((\d+)\)/);
+        if (m) sidCount[m[1]] = (sidCount[m[1]] || 0) + 1;
+    });
+    // Build map only for unique SIDs (count === 1)
+    // Also build procBitrate: serviceName → kbps.
+    // Key = full channel name before first '(' (e.g. "EBCFNews QT", "FTV NEWS").
+    // Also add hash-stripped variant (e.g. "TVBSN SRT#1" → also stores "TVBSN SRT")
+    // so that input "TVBSN SRT" can do a direct lookup.
+    svcNodes.forEach(function(n) {
+        var m = (n.title || '').match(/\((\d+)\)/);
+        if (m && sidCount[m[1]] === 1) {
+            var svcName = (n.title || '').split('(')[0].trim();
+            if (svcName) autoSidMap[m[1]] = svcName;
+        }
+        // procBitrate keys: full-name AND hash-stripped variant
+        var bm = (n.tooltip || '').match(/cur:\s*([\d.]+)/);
+        if (bm) {
+            var kbps = Math.round(parseFloat(bm[1]) * 1000000 / 1000);
+            var fullName = (n.title || '').split('(')[0].trim();
+            if (fullName) {
+                procBitrate[fullName] = kbps;
+                // Strip trailing "#N" so "TVBSN SRT#1" also registers as "TVBSN SRT"
+                var noHash = fullName.replace(/#\d+$/, '').trim();
+                if (noHash !== fullName && noHash) procBitrate[noHash] = kbps;
+            }
+        }
+    });
+} catch(e) {}
+
+// Manual override: resolve remaining "Program NNN" via {$INPUT.NAME.MAP}.
+// Key = "IP:Port:SID" (e.g. "230.0.0.26:3539:503"), value = channel name.
+// Only needed for streams with non-unique SIDs or not in the service tree.
+var nameMap = {};
+try { nameMap = JSON.parse('{$INPUT.NAME.MAP}'); } catch(e) {}
+
+cards.forEach(function(card) {
+    // Step 1: Trigger server-side data refresh for this card (returns 204)
+    var ref = new HttpRequest();
+    try { ref.setopt(64, 0); } catch(e) {}
+    try { ref.setopt(81, 0); } catch(e) {}
+    ref.addHeader('Cookie: ' + cookieHdr);
+    ref.get(url + '/bitrates/input/refresh?s_xID=' + encodeURIComponent(card) + '&filter=Service');
+
+    // Step 2: Fetch the data table rows
+    var api = new HttpRequest();
+    try { api.setopt(64, 0); } catch(e) {}
+    try { api.setopt(81, 0); } catch(e) {}
+    api.addHeader('Content-Type: application/x-www-form-urlencoded');
+    api.addHeader('Cookie: ' + cookieHdr);
+    var resp = api.post(
+        url + '/bitrates/input/get_rows?s_xID=' + encodeURIComponent(card) + '&filter=Service',
+        'table_id=bitrates_serv_input_table&paging_info_bitrates_serv_input_table=' +
+        encodeURIComponent('{"start_row":0,"rows_to_show":500}')
+    );
+
+    if (!resp) return;
+
+    // Extract tbl_data_bitrates_serv_input_table='[...]' from the JS/XML response
+    var marker = "tbl_data_bitrates_serv_input_table='";
+    var idx = resp.indexOf(marker);
+    if (idx < 0) return;
+    var start = idx + marker.length;
+    var end = resp.indexOf("';", start);
+    if (end < 0) end = resp.indexOf("'\n", start);
+    if (end < 0) return;
+
+    // Decode HTML entities (&quot; → ", &amp; → &, &#39; → ', &lt; → <, &gt; → >)
+    var encoded = resp.substring(start, end);
+    var decoded = encoded
+        .replace(/&quot;/g, '"')
+        .replace(/&amp;/g, '&')
+        .replace(/&#39;/g, "'")
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>');
+
+    var rows;
+    try { rows = JSON.parse(decoded); } catch(e) { return; }
+
+    // columns: [0]App [1]Port [2]IP/VLAN [3]UDP_Port [4]ON_ID [5]TS_ID_link
+    //          [6]TS_ID_link [7]SID [8]Name [9]Current [10]Avg [11]Min [12]Peak [13]Detail
+    rows.forEach(function(row) {
+        var vals = row.values || [];
+        var name = (vals[8] || '').trim();
+        var sid  = (vals[7] || '').trim();
+        var ip   = (vals[2] || '').trim();
+        var port = (vals[3] || '').trim();
+        var curStr = (vals[9] || '0').trim();
+        var cur  = Math.round(parseFloat(curStr) * 1000000);
+        if (isNaN(cur)) cur = 0;
+
+        if (!name) return;
+
+        // If vDCM shows generic "Program NNN" (unnamed SID), resolve real channel name:
+        // 1. Auto: look up unique SID in service tree (autoSidMap built from opennode2 above)
+        // 2. Manual fallback: {$INPUT.NAME.MAP} macro keyed by "IP:Port:SID"
+        if (/^Program\s+\d+$/i.test(name)) {
+            if (autoSidMap[sid]) {
+                name = autoSidMap[sid];
+            } else {
+                var mapKey = ip + ':' + port + ':' + sid;
+                if (nameMap[mapKey]) name = nameMap[mapKey];
+            }
+        }
+
+        // Unique key: name + ip:port avoids collision when same name appears on different inputs
+        var uniqKey = name + '|' + ip + ':' + port;
+        if (seenKeys[uniqKey]) return;
+        seenKeys[uniqKey] = true;
+
+        // Sanitize key for Zabbix item key (alphanumeric, dot, underscore, hyphen only)
+        var zbxKey = uniqKey.replace(/[^a-zA-Z0-9._-]/g, '_');
+
+        // Human-readable source: RTMP push streams show '-' as IP → label as port:NNN
+        var src = (ip === '-' || ip === '') ? ('port:' + port) : (ip + ':' + port);
+
+        allInputs.push({ key: zbxKey, name: name, ip: ip, port: port, src: src, bps: cur, card: card });
+    });
+});
+
+// Query Port 5 output bitrate table to check if each INPUT stream's
+// corresponding OUTPUT channel is active.
+// Guard logic: input low + output stopped (= 0) = real fault;
+//              input low + output running (> 0) = VBR fluctuation, suppress.
+// Matching: exact name OR prefix-before-' (' match against output col[10].
+// out_kbps = -1 → no output match found → guard disabled (fires on threshold alone).
+var outCard = '{$VDCM.OUTPUT.CARD}';
+var outByPrefix = {};  // channelPrefix → total kbps (before first ' (' in name)
+var outByExact  = {};  // exactName → total kbps (exact SRT passthrough row names)
+var outByBase   = {};  // baseName  → total kbps (SRT name with trailing " SRT" / " SRT#N" stripped)
+if (outCard) {
+    try {
+        var outRef = new HttpRequest();
+        try { outRef.setopt(64, 0); } catch(e) {}
+        try { outRef.setopt(81, 0); } catch(e) {}
+        outRef.addHeader('Cookie: ' + cookieHdr);
+        outRef.get(url + '/bitrates/output/refresh?s_xID=' + encodeURIComponent(outCard) + '&filter=Service');
+        var outApi = new HttpRequest();
+        try { outApi.setopt(64, 0); } catch(e) {}
+        try { outApi.setopt(81, 0); } catch(e) {}
+        outApi.addHeader('Content-Type: application/x-www-form-urlencoded');
+        outApi.addHeader('Cookie: ' + cookieHdr);
+        var outResp = outApi.post(
+            url + '/bitrates/output/get_rows?s_xID=' + encodeURIComponent(outCard) + '&filter=Service',
+            'table_id=bitrates_serv_output_table&paging_info_bitrates_serv_output_table=' +
+            encodeURIComponent('{"start_row":0,"rows_to_show":500}')
+        );
+        if (outResp) {
+            var outMarker = "tbl_data_bitrates_serv_output_table='";
+            var outIdx = outResp.indexOf(outMarker);
+            if (outIdx >= 0) {
+                var outStart = outIdx + outMarker.length;
+                var outEnd = outResp.indexOf("';", outStart);
+                if (outEnd < 0) outEnd = outResp.indexOf("'\n", outStart);
+                if (outEnd >= 0) {
+                    var outEncoded = outResp.substring(outStart, outEnd);
+                    var outDecoded = outEncoded
+                        .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+                        .replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+                    var outRows = JSON.parse(outDecoded);
+                    // col[10] = channel name (e.g. "DayStarMain (1920x1080p...)" or "EBCNews SRT")
+                    // col[11] = current Mbps
+                    outRows.forEach(function(row) {
+                        var vals = row.values || [];
+                        var rowName = (vals[10] || '').trim();
+                        var curMbps = parseFloat((vals[11] || '0').trim());
+                        if (!rowName || isNaN(curMbps)) return;
+                        // Skip MR resolution rows (e.g. "FTV-HD (1920x1080p30 @ 5000 kbps) (MR)").
+                        // These are ABR/HLS outputs that go through a different port — always cur=0
+                        // on Port 5 even when encoding is healthy. Including them causes false guards.
+                        if (/ @ \d+ kbps\)/.test(rowName)) return;
+                        var curKbps = Math.round(curMbps * 1000);
+                        // Exact match ("EBCNews SRT", "CTSMainSRT", "EBCF", "TVBSN SRT" etc.)
+                        outByExact[rowName] = (outByExact[rowName] || 0) + curKbps;
+                        // Prefix before ' (' (for any remaining grouped names)
+                        var sp = rowName.indexOf(' (');
+                        if (sp >= 0) {
+                            var prefix = rowName.substring(0, sp);
+                            outByPrefix[prefix] = (outByPrefix[prefix] || 0) + curKbps;
+                        }
+                        // Base name: strip trailing " SRT" or " SRT#N" so that input
+                        // "FTV-HD" can match output "FTV-HD SRT" (vDCM SRT passthrough naming).
+                        var baseName = rowName.replace(/ SRT(#\d+)?$/, '').trim();
+                        if (baseName && baseName !== rowName) {
+                            outByBase[baseName] = (outByBase[baseName] || 0) + curKbps;
+                        }
+                    });
+                }
+            }
+        }
+    } catch(e) {}
+}
+
+// Annotate each input stream with its corresponding output bitrate (for guard condition)
+// getProc: look up Processing service bitrate for input name n.
+// Tries: (1) exact n, (2) n with " SRT" suffix stripped (SRT passthrough channels
+//        like "EBCNews SRT" input → "EBCNews" processing service).
+// Manual INPUT name → Processing service name override map
+var inputProcMap = {};
+try { inputProcMap = JSON.parse('{$INPUT.PROC.NAME.MAP}'); } catch(e) {}
+
+function normStr(s) { return s.toLowerCase().replace(/[^a-z0-9]/g, ''); }
+function cpLen(a, b) {
+    var n = Math.min(a.length, b.length);
+    for (var i = 0; i < n; i++) { if (a[i] !== b[i]) return i; }
+    try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+    return n;
+}
+
+function getProc(n) {
+    // 0. Manual override via {$INPUT.PROC.NAME.MAP} — highest priority,
+    //    overrides all auto-matching.
+    //    Use proc name to force a mapping (e.g. "SET iNEWS"→"SET-88"),
+    //    or use "" (empty string) to mark as passthrough/no-proc (returns -1,
+    //    disables proc fallback so Port5 drop will fire directly).
+    if (n in inputProcMap) {
+        var mapped = inputProcMap[n];
+        if (mapped === '') return -1;
+        if (mapped in procBitrate) return procBitrate[mapped];
+    }
+    // 1. Exact match
+    if (n in procBitrate) return procBitrate[n];
+    // 2. Strip " SRT" suffix (e.g. "EBCNews SRT" → "EBCNews")
+    var stripped = n.replace(/ SRT$/i, '').trim();
+    if (stripped !== n && stripped in procBitrate) return procBitrate[stripped];
+    // 3. Space normalization (e.g. "EBCNews QT" → matches "EBCNewsQT")
+    var noSpace = n.replace(/\s+/g, '');
+    for (var k in procBitrate) {
+        if (k.replace(/\s+/g, '') === noSpace) return procBitrate[k];
+    }
+    // 4. Normalized prefix overlap (lowercase + strip non-alphanumeric).
+    //    Handles: abbreviations ("FTV" → "FTV-HD"), truncated API names
+    //    ("CTS News Information Channe" → "CTSNewsQT"), space/case variants.
+    //    Requires ≥60% overlap of common prefix relative to shorter normalized name.
+    //    On tie, prefer the shorter processing service name (most specific match).
+    var normN = normStr(n);
+    var bestScore = 0.6;
+    var bestKey = null;
+    var bestKLen = 999;
+    for (var pk in procBitrate) {
+        var normK = normStr(pk);
+        var shorter = Math.min(normN.length, normK.length);
+        if (shorter < 3) continue;
+        var score = cpLen(normN, normK) / shorter;
+        if (score > bestScore || (score === bestScore && normK.length < bestKLen)) {
+            bestScore = score;
+            bestKey = pk;
+            bestKLen = normK.length;
+        }
+    }
+    if (bestKey !== null) return procBitrate[bestKey];
+    try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+    return -1;
+}
+
+allInputs.forEach(function(inp) {
+    var n = inp.name;
+    // Port 5 SRT output lookup (MR rows already excluded from outBy* maps)
+    var port5Val = -1;
+    if (n in outByExact)       port5Val = outByExact[n];
+    else if (n in outByPrefix)  port5Val = outByPrefix[n];
+    else if (n in outByBase)    port5Val = outByBase[n];
+
+    // Processing layer lookup (fallback for ABR channels and passive SRT streams)
+    var procVal = getProc(n);
+
+    // Guard decision:
+    //  Port5 > 0                  → suppress (SRT actively sending)
+    //  Port5 = 0 AND Proc > 0     → suppress (SRT passive/standby BUT encoding healthy)
+    //  Port5 = 0 AND Proc = 0     → 0  (fire: both stopped → real fault)
+    //  Port5 = 0 AND Proc = -1    → -1 (guard disabled: Port5 passive, no proc ref)
+    //  Port5 = -1 AND Proc >= 0   → use Proc (no SRT match, use Processing health)
+    //  Port5 = -1 AND Proc = -1   → -1 (guard disabled, fires on threshold)
+    if (port5Val > 0) {
+        inp.out_kbps = port5Val;
+    } else if (port5Val === 0 && procVal > 0) {
+        inp.out_kbps = procVal;   // SRT passive but encoding healthy → suppress
+    } else if (port5Val === 0 && procVal === 0) {
+        inp.out_kbps = 0;         // Both stopped → fire
+    } else if (port5Val === 0) {  // procVal = -1
+        inp.out_kbps = -1;        // SRT passive, no proc reference → guard disabled
+    } else if (procVal >= 0) {
+        inp.out_kbps = procVal;   // No Port5 match, use Processing (0 or >0)
+    } else {
+        inp.out_kbps = -1;
+    }
+});
+
+if (allInputs.length === 0) {
+    throw new Error('No input streams found. Cards: "' + cards.join(',') + '". Verify cards are active and {$VDCM.INPUT.CARDS} is correct.');
+}
+
+try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+return JSON.stringify(allInputs);
+var url = '{$VDCM.URL}'.replace(/\/+$/, '');
+var user = '{$VDCM.USER}';
+var pass = '{$VDCM.PASS}';
+
+if (!url || url.indexOf('http') !== 0) {
+    throw new Error('Invalid {$VDCM.URL}: "' + url + '". Set https://hostname[:port] in host macros.');
+}
+
+// Login — POST /login_handler?came_from=/ → HTTP 302 + Set-Cookie
+var login = new HttpRequest();
+try { login.setopt(64, 0); } catch(e) {}  // CURLOPT_SSL_VERIFYPEER
+try { login.setopt(81, 0); } catch(e) {}  // CURLOPT_SSL_VERIFYHOST
+try { login.setopt(52, 0); } catch(e) {}  // CURLOPT_FOLLOWLOCATION: don't follow 302
+login.addHeader('Content-Type: application/x-www-form-urlencoded');
+login.post(
+    url + '/login_handler?came_from=%2F',
+    'login=' + encodeURIComponent(user) +
+    '&password=' + encodeURIComponent(pass) +
+    '&login_button=Login'
+);
+var loginCode = login.getStatus();
+
+// Extract cookies — getHeaders(false)=object, fallback to raw string parse
+var cookies = [];
+try {
+    var hdrs = login.getHeaders(false);
+    if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+        Object.keys(hdrs).forEach(function(k) {
+            if (k.toLowerCase() === 'set-cookie') {
+                var v = hdrs[k];
+                (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                    var p = c.split(';')[0].trim();
+                    if (p) cookies.push(p);
+                });
+            }
+        });
+    }
+} catch(e) {}
+if (cookies.length === 0) {
+    try {
+        var raw = login.getHeaders(true);
+        if (typeof raw !== 'string') raw = String(raw);
+        (raw.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+            var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+            if (p) cookies.push(p);
+        });
+    } catch(e) {}
+}
+if (cookies.length === 0) {
+    throw new Error('Login failed (HTTP ' + loginCode + '). No cookies. URL=' + url + ' user=' + user + '. Set {$VDCM.URL}/{$VDCM.PASS} in host macros.');
+}
+
+// Fetch alarm footer
+var api = new HttpRequest();
+try { api.setopt(64, 0); } catch(e) {}
+try { api.setopt(81, 0); } catch(e) {}
+api.addHeader('Cookie: ' + cookies.join('; '));
+var response = api.get(url + '/load_alarm_footer');
+
+if (!response) {
+    throw new Error('vDCM /load_alarm_footer returned empty response.');
+}
+
+// Parse JavaScript assignment patterns from the returned HTML/JS snippet
+var alarmMatch  = response.match(/device_status'\)\.textContent\s*=\s*'([^']*)'/);
+var stateMatch  = response.match(/device_state'\)\.textContent\s*=\s*'([^']*)'/);
+var vdcmMatch   = response.match(/vdcm_state'\)\.textContent\s*=\s*'([^']*)'/);
+
+var alarmCount  = alarmMatch ? parseInt(alarmMatch[1], 10) : -1;
+var deviceState = stateMatch ? stateMatch[1] : 'unknown';
+var vdcmState   = vdcmMatch  ? vdcmMatch[1]  : 'unknown';
+
+try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+return JSON.stringify({
+    alarm_count:  alarmCount,
+    device_state: deviceState,
+    vdcm_state:   vdcmState
+});
+var url  = '{$VDCM.URL}'.replace(/\/+$/, '');
+var user = '{$VDCM.USER}';
+var pass = '{$VDCM.PASS}';
+
+if (!url || url.indexOf('http') !== 0) {
+    throw new Error('Invalid {$VDCM.URL}: "' + url + '"');
+}
+
+// Login — POST /login_handler?came_from=/
+var login = new HttpRequest();
+try { login.setopt(64, 0); } catch(e) {}
+try { login.setopt(81, 0); } catch(e) {}
+try { login.setopt(52, 0); } catch(e) {}
+login.addHeader('Content-Type: application/x-www-form-urlencoded');
+login.post(
+    url + '/login_handler?came_from=%2F',
+    'login=' + encodeURIComponent(user) +
+    '&password=' + encodeURIComponent(pass) +
+    '&login_button=Login'
+);
+var loginCode = login.getStatus();
+
+var cookies = [];
+try {
+    var hdrs = login.getHeaders(false);
+    if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+        Object.keys(hdrs).forEach(function(k) {
+            if (k.toLowerCase() === 'set-cookie') {
+                var v = hdrs[k];
+                (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                    var p = c.split(';')[0].trim();
+                    if (p) cookies.push(p);
+                });
+            }
+        });
+    }
+} catch(e) {}
+if (cookies.length === 0) {
+    try {
+        var rawHdr = login.getHeaders(true);
+        if (typeof rawHdr !== 'string') rawHdr = String(rawHdr);
+        (rawHdr.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+            var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+            if (p) cookies.push(p);
+        });
+    } catch(e) {}
+}
+if (cookies.length === 0) {
+    throw new Error('Login failed (HTTP ' + loginCode + '). Check {$VDCM.URL}/{$VDCM.USER}/{$VDCM.PASS}.');
+}
+
+// Query alarm rows — POST /status/alarms/get_rows
+// NOTE: On some firmware versions (litv_tran1/tran2) this endpoint returns
+// HTTP 204 (No Content). In that case fall back to /status page tbldevicealarms.
+var api = new HttpRequest();
+try { api.setopt(64, 0); } catch(e) {}
+try { api.setopt(81, 0); } catch(e) {}
+api.addHeader('Content-Type: application/x-www-form-urlencoded');
+api.addHeader('Cookie: ' + cookies.join('; '));
+var resp = api.post(
+    url + '/status/alarms/get_rows',
+    'table_id=status_alarm_table&paging_info_status_alarm_table=' +
+    encodeURIComponent('{"start_row":0,"rows_to_show":500}')
+);
+
+// Fallback: if /status/alarms/get_rows returns empty (HTTP 204 on some firmware),
+// use the /status page tbldevicealarms table instead.
+if (!resp) {
+    var fbApi = new HttpRequest();
+    try { fbApi.setopt(64, 0); } catch(e) {}
+    try { fbApi.setopt(81, 0); } catch(e) {}
+    fbApi.addHeader('Cookie: ' + cookies.join('; '));
+    resp = fbApi.get(url + '/status');
+    if (!resp) return 'OK';
+    function fbDecYW(r) {
+        try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+        return r.replace(/&quot;/g,'"').replace(/&amp;/g,'&')
+            .replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>');
+    }
+    function fbTblYW(pg, nm) {
+        var mk=nm+"='", ii=(pg||'').indexOf(mk); if(ii<0) return [];
+        var jj=pg.indexOf("';",ii+mk.length); if(jj<0) return [];
+        try{return JSON.parse(fbDecYW(pg.substring(ii+mk.length,jj)));}catch(e2){return [];}
+    }
+    var totAlarmsYW=0;
+    ['tbl_data_tbldevicealarms','tbl_data_tblioalarms'].forEach(function(t2){
+        fbTblYW(resp,t2).forEach(function(r2){
+            (r2.values||[]).forEach(function(c2){
+                var s2=String(c2||'');
+                if(s2.charAt(0)==='{'){try{var o2=JSON.parse(s2);if(o2.class==='LinkControl')totAlarmsYW+=parseInt(o2.content,10)||0;}catch(e3){}}
+            });
+        });
+    });
+    var rows;
+    if(totAlarmsYW>0){
+        var detApiYW=new HttpRequest();
+        try{detApiYW.setopt(64,0);}catch(e){}
+        try{detApiYW.setopt(81,0);}catch(e){}
+        detApiYW.addHeader('Cookie: '+cookies.join('; '));
+        var detPageYW=detApiYW.get(url+'/status/device');
+        var detRowsYW=fbTblYW(detPageYW,'tbl_data_device_detail_table');
+        rows=detRowsYW.length>0?detRowsYW:fbTblYW(resp,'tbl_data_tbldevicealarms');
+    }else{
+        rows=fbTblYW(resp,'tbl_data_tbldevicealarms');
+    }
+    var NOISE = ['PTS Discontinuity','UDP Stream Loss','TS Stream Loss','Input Signal Loss','No Input Signal'];
+    function stripHtmlFb(s) { return String(s||'').replace(/<[^>]+>/g,'').trim(); }
+    var parts = []; var seen = {};
+    rows.forEach(function(row) {
+        var v = row.values || [];
+        var hasLinkCtrl = false, totalCount = 0, texts = [];
+        v.forEach(function(cell) {
+            // Support cell as Object (parsed JSON) OR as JSON string
+            var lc = (cell && typeof cell === 'object') ? cell : null;
+            if (!lc) {
+                var s = String(cell || '');
+                if (s.charAt(0) === '{') { try { lc = JSON.parse(s); } catch(e) {} }
+            }
+            if (lc && lc['class'] === 'LinkControl') {
+                hasLinkCtrl = true;
+                var n = parseInt(lc.content, 10);
+                if (!isNaN(n)) totalCount += n;
+                return;
+            }
+            var t = stripHtmlFb(String(cell || ''));
+            if (t.length > 1 && !/^\d+$/.test(t)) texts.push(t);
+        });
+        var isNoise = NOISE.some(function(n){ return texts.some(function(t){ return t.indexOf(n)>=0; }); });
+        if (isNoise) return;
+        if (hasLinkCtrl) {
+            // Skip summary-level LinkControl rows (not actionable for encoder monitoring)
+        } else if (texts.length > 0) {
+            var entry = texts.join(' | ');
+            if (!seen[entry]) { seen[entry]=true; parts.push(entry); }
+        }
+    });
+    try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+    return parts.length > 0 ? parts.join(', ') : 'OK';
+}
+
+// Parse tbl_data_status_alarm_table='[...]'
+var marker = "tbl_data_status_alarm_table='";
+var idx = resp.indexOf(marker);
+if (idx < 0) return 'OK';
+var start = idx + marker.length;
+var end = resp.indexOf("';", start);
+if (end < 0) return 'OK';
+
+var encoded = resp.substring(start, end);
+var decoded = encoded
+    .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+    .replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+
+var rows;
+try { rows = JSON.parse(decoded); } catch(e) { return 'OK'; }
+
+// Background noise patterns — filter these out (always present on litv devices)
+var NOISE = [
+    'PTS Discontinuity',
+    'UDP Stream Loss',
+    'TS Stream Loss',
+    'Input Signal Loss',
+    'No Input Signal'
+];
+
+function stripHtml(s) { return String(s || '').replace(/<[^>]+>/g, '').trim(); }
+
+var seen = {}; var parts = [];
+rows.forEach(function(row) {
+    var v = row.values || [];
+    var hasLinkCtrl = false, totalCount = 0, texts = [];
+    v.forEach(function(cell) {
+        // Support cell as Object (parsed JSON) OR as JSON string
+        var lc = (cell && typeof cell === 'object') ? cell : null;
+        if (!lc) {
+            var s = String(cell || '');
+            if (s.charAt(0) === '{') { try { lc = JSON.parse(s); } catch(e) {} }
+        }
+        if (lc && lc['class'] === 'LinkControl') {
+            hasLinkCtrl = true;
+            var n = parseInt(lc.content, 10);
+            if (!isNaN(n)) totalCount += n;
+            return;
+        }
+        var t = stripHtml(String(cell || ''));
+        if (t.length > 1 && !/^\d+$/.test(t)) texts.push(t);
+    });
+    var isNoise = NOISE.some(function(noise) {
+        try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+        return texts.some(function(t) { return t.indexOf(noise) >= 0; });
+    });
+    if (isNoise) return;
+    if (hasLinkCtrl) {
+        // Skip summary-level LinkControl rows (not actionable for encoder monitoring)
+    } else if (texts.length > 0) {
+        var entry = texts.join(' | ');
+        if (!seen[entry]) { seen[entry]=true; parts.push(entry); }
+    }
+});
+if (parts.length === 0) return 'OK';
+try{var _lo=new HttpRequest();try{_lo.setopt(64,0);}catch(e){}try{_lo.setopt(81,0);}catch(e){}_lo.addHeader('Cookie: '+cookies.join('; '));_lo.get(url+'/logout');}catch(e){}
+return parts.join(', ');
+            var url  = '{$VDCM.URL}'.replace(/\/+$/, '');
+            var user = '{$VDCM.USER}';
+            var pass = '{$VDCM.PASS}';
+            
+            if (!url || url.indexOf('http') !== 0) {
+                throw new Error('Invalid {$VDCM.URL}: "' + url + '"');
+            }
+            
+            // Login — POST /login_handler?came_from=/
+            var login = new HttpRequest();
+            try { login.setopt(64, 0); } catch(e) {}
+            try { login.setopt(81, 0); } catch(e) {}
+            try { login.setopt(52, 0); } catch(e) {}
+            login.addHeader('Content-Type: application/x-www-form-urlencoded');
+            login.post(
+                url + '/login_handler?came_from=%2F',
+                'login=' + encodeURIComponent(user) +
+                '&password=' + encodeURIComponent(pass) +
+                '&login_button=Login'
+            );
+            var loginCode = login.getStatus();
+            
+            var cookies = [];
+            try {
+                var hdrs = login.getHeaders(false);
+                if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+                    Object.keys(hdrs).forEach(function(k) {
+                        if (k.toLowerCase() === 'set-cookie') {
+                            var v = hdrs[k];
+                            (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                                var p = c.split(';')[0].trim();
+                                if (p) cookies.push(p);
+                            });
+                        }
+                    });
+                }
+            } catch(e) {}
+            if (cookies.length === 0) {
+                try {
+                    var rawHdr = login.getHeaders(true);
+                    if (typeof rawHdr !== 'string') rawHdr = String(rawHdr);
+                    (rawHdr.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+                        var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+                        if (p) cookies.push(p);
+                    });
+                } catch(e) {}
+            }
+            if (cookies.length === 0) {
+                throw new Error('Login failed (HTTP ' + loginCode + '). Check {$VDCM.URL}/{$VDCM.USER}/{$VDCM.PASS}.');
+            }
+            
+            // Query alarm rows — POST /status/alarms/get_rows
+            // NOTE: On some firmware versions (litv_tran1/tran2) this endpoint returns
+            // HTTP 204 (No Content). In that case fall back to /status page tbldevicealarms.
+            var api = new HttpRequest();
+            try { api.setopt(64, 0); } catch(e) {}
+            try { api.setopt(81, 0); } catch(e) {}
+            api.addHeader('Content-Type: application/x-www-form-urlencoded');
+            api.addHeader('Cookie: ' + cookies.join('; '));
+            var resp = api.post(
+                url + '/status/alarms/get_rows',
+                'table_id=status_alarm_table&paging_info_status_alarm_table=' +
+                encodeURIComponent('{"start_row":0,"rows_to_show":500}')
+            );
+            
+            // Fallback: if /status/alarms/get_rows returns empty (HTTP 204 on some firmware),
+            // use the /status page tbldevicealarms table instead.
+            if (!resp) {
+                var fbApi = new HttpRequest();
+                try { fbApi.setopt(64, 0); } catch(e) {}
+                try { fbApi.setopt(81, 0); } catch(e) {}
+                fbApi.addHeader('Cookie: ' + cookies.join('; '));
+                resp = fbApi.get(url + '/status');
+                if (!resp) return 'OK';
+                function fbDecYW(r) {
+                    return r.replace(/&quot;/g,'"').replace(/&amp;/g,'&')
+                        .replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>');
+                }
+                function fbTblYW(pg, nm) {
+                    var mk=nm+"='", ii=(pg||'').indexOf(mk); if(ii<0) return [];
+                    var jj=pg.indexOf("';",ii+mk.length); if(jj<0) return [];
+                    try{return JSON.parse(fbDecYW(pg.substring(ii+mk.length,jj)));}catch(e2){return [];}
+                }
+                var totAlarmsYW=0;
+                ['tbl_data_tbldevicealarms','tbl_data_tblioalarms'].forEach(function(t2){
+                    fbTblYW(resp,t2).forEach(function(r2){
+                        (r2.values||[]).forEach(function(c2){
+                            var s2=String(c2||'');
+                            if(s2.charAt(0)==='{'){try{var o2=JSON.parse(s2);if(o2.class==='LinkControl')totAlarmsYW+=parseInt(o2.content,10)||0;}catch(e3){}}
+                        });
+                    });
+                });
+                var rows;
+                if(totAlarmsYW>0){
+                    var detApiYW=new HttpRequest();
+                    try{detApiYW.setopt(64,0);}catch(e){}
+                    try{detApiYW.setopt(81,0);}catch(e){}
+                    detApiYW.addHeader('Cookie: '+cookies.join('; '));
+                    var detPageYW=detApiYW.get(url+'/status/device');
+                    var detRowsYW=fbTblYW(detPageYW,'tbl_data_device_detail_table');
+                    rows=detRowsYW.length>0?detRowsYW:fbTblYW(resp,'tbl_data_tbldevicealarms');
+                }else{
+                    rows=fbTblYW(resp,'tbl_data_tbldevicealarms');
+                }
+                var NOISE = ['PTS Discontinuity','UDP Stream Loss','TS Stream Loss','Input Signal Loss','No Input Signal'];
+                function stripHtmlFb(s) { return String(s||'').replace(/<[^>]+>/g,'').trim(); }
+                var parts = []; var seen = {};
+                rows.forEach(function(row) {
+                    var v = row.values || [];
+                    var hasLinkCtrl = false, totalCount = 0, texts = [];
+                    v.forEach(function(cell) {
+                        var lc = (cell && typeof cell === 'object') ? cell : null;
+                        if (!lc) {
+                            var s = String(cell || '');
+                            if (s.charAt(0) === '{') { try { lc = JSON.parse(s); } catch(e) {} }
+                        }
+                        if (lc && lc['class'] === 'LinkControl') {
+                            hasLinkCtrl = true;
+                            var n = parseInt(lc.content, 10);
+                            if (!isNaN(n)) totalCount += n;
+                            return;
+                        }
+                        var t = stripHtmlFb(String(cell || ''));
+                        if (t.length > 1 && !/^\d+$/.test(t)) texts.push(t);
+                    });
+                    var isNoise = NOISE.some(function(n){ return texts.some(function(t){ return t.indexOf(n)>=0; }); });
+                    if (isNoise) return;
+                    if (hasLinkCtrl) {
+                        // Skip summary-level LinkControl rows (not actionable for encoder monitoring)
+                    } else if (texts.length > 0) {
+                        var entry = texts.join(' | ');
+                        if (!seen[entry]) { seen[entry]=true; parts.push(entry); }
+                    }
+                });
+                return parts.length > 0 ? parts.join(', ') : 'OK';
+            }
+            
+            // Parse tbl_data_status_alarm_table='[...]'
+            var marker = "tbl_data_status_alarm_table='";
+            var idx = resp.indexOf(marker);
+            if (idx < 0) return 'OK';
+            var start = idx + marker.length;
+            var end = resp.indexOf("';", start);
+            if (end < 0) return 'OK';
+            
+            var encoded = resp.substring(start, end);
+            var decoded = encoded
+                .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+                .replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+            
+            var rows;
+            try { rows = JSON.parse(decoded); } catch(e) { return 'OK'; }
+            
+            // Background noise patterns — filter these out (always present on litv devices)
+            var NOISE = [
+                'PTS Discontinuity',
+                'UDP Stream Loss',
+                'TS Stream Loss',
+                'Input Signal Loss',
+                'No Input Signal'
+            ];
+            
+            function stripHtml(s) { return String(s || '').replace(/<[^>]+>/g, '').trim(); }
+            
+            var seen = {}; var parts = [];
+            rows.forEach(function(row) {
+                var v = row.values || [];
+                var hasLinkCtrl = false, totalCount = 0, texts = [];
+                v.forEach(function(cell) {
+                    var lc = (cell && typeof cell === 'object') ? cell : null;
+                    if (!lc) {
+                        var s = String(cell || '');
+                        if (s.charAt(0) === '{') { try { lc = JSON.parse(s); } catch(e) {} }
+                    }
+                    if (lc && lc['class'] === 'LinkControl') {
+                        hasLinkCtrl = true;
+                        var n = parseInt(lc.content, 10);
+                        if (!isNaN(n)) totalCount += n;
+                        return;
+                    }
+                    var t = stripHtml(String(cell || ''));
+                    if (t.length > 1 && !/^\d+$/.test(t)) texts.push(t);
+                });
+                var isNoise = NOISE.some(function(noise) {
+                    return texts.some(function(t) { return t.indexOf(noise) >= 0; });
+                });
+                if (isNoise) return;
+                if (hasLinkCtrl) {
+                    // Skip summary-level LinkControl rows (not actionable for encoder monitoring)
+                } else if (texts.length > 0) {
+                    var entry = texts.join(' | ');
+                    if (!seen[entry]) { seen[entry]=true; parts.push(entry); }
+                }
+            });
+            if (parts.length === 0) return 'OK';
+            return parts.join(', ');
+          description: |
+            Queries /status/alarms/get_rows for all active alarms and filters out permanent background noise. Returns "OK" when only background noise is present, or comma-separated alarm descriptions for non-background alarms. Background noise on litv_tran1/tran2 (always present, normal):
+              - PTS Discontinuity: RTMP VBR streams
+              - UDP Stream Loss / TS Stream Loss: unused/empty RTMP port slots
+              - Input Signal Loss / No Input Signal: empty port slots
+            Non-background alarms indicate real faults: Equipment failure, Environmental alerts, or unexpected Communication faults. For encoding-layer (Processing class) faults with channel names, see vdcm.processing.alarms which queries the Processing status page.
+          timeout: 30s
+          triggers:
+            - uuid: c4d5e6f7a8b9402184c4d5e6f7a8b9c5
+              expression: 'last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.alarms.detail)<>"OK"'
+              name: 'vDCM: unexpected alarm — {ITEM.LASTVALUE}'
+              priority: AVERAGE
+              description: |
+                Non-background alarm(s) detected on the vDCM device. Alarm details: {ITEM.LASTVALUE} (Format: all text fields from alarm row joined by " | ", comma-separated if multiple) Background noise excluded from this trigger:
+                  - PTS Discontinuity: RTMP VBR streams — always present, normal
+                  - UDP/TS Stream Loss: empty RTMP port slots — always present, normal
+                  - Input Signal Loss / No Input Signal: empty slots — normal
+                This trigger fires for Equipment, Environmental, or unexpected alarms. For encoding-layer faults (Processing class) with channel names, see vdcm.processing.alarms (HIGH priority). Investigate at {$VDCM.URL} → Status > Summary.
+        - uuid: 8c921d0fc4914cfa8461a34d550e7c27
+          name: 'vDCM active alarm count'
+          type: DEPENDENT
+          key: vdcm.device.alarms
+          history: 90d
+          description: 'Number of active alarms on the vDCM device. Sourced from /load_alarm_footer device_status field. Value -1 indicates the field could not be parsed (check template logs).'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.alarm_count
+          master_item:
+            key: vdcm.device.status
+        - uuid: 5b6cdcbf4e2c438fa98d2e3f32863969
+          name: 'vDCM device state'
+          type: DEPENDENT
+          key: vdcm.device.state
+          history: 90d
+          value_type: TEXT
+          description: 'vDCM device operational role string (e.g. "Active - Role: Standalone"). Sourced from /load_alarm_footer device_state element. Informational only.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.device_state
+          master_item:
+            key: vdcm.device.status
+        - uuid: d74febf23647445e88763b1c0f34d7d9
+          name: 'vDCM device health status'
+          type: SCRIPT
+          key: vdcm.device.status
+          delay: 2m
+          history: 7d
+          value_type: TEXT
+          params: |
+            var url = '{$VDCM.URL}'.replace(/\/+$/, '');
+            var user = '{$VDCM.USER}';
+            var pass = '{$VDCM.PASS}';
+            
+            if (!url || url.indexOf('http') !== 0) {
+                throw new Error('Invalid {$VDCM.URL}: "' + url + '". Set https://hostname[:port] in host macros.');
+            }
+            
+            // Login — POST /login_handler?came_from=/ → HTTP 302 + Set-Cookie
+            var login = new HttpRequest();
+            try { login.setopt(64, 0); } catch(e) {}  // CURLOPT_SSL_VERIFYPEER
+            try { login.setopt(81, 0); } catch(e) {}  // CURLOPT_SSL_VERIFYHOST
+            try { login.setopt(52, 0); } catch(e) {}  // CURLOPT_FOLLOWLOCATION: don't follow 302
+            login.addHeader('Content-Type: application/x-www-form-urlencoded');
+            login.post(
+                url + '/login_handler?came_from=%2F',
+                'login=' + encodeURIComponent(user) +
+                '&password=' + encodeURIComponent(pass) +
+                '&login_button=Login'
+            );
+            var loginCode = login.getStatus();
+            
+            // Extract cookies — getHeaders(false)=object, fallback to raw string parse
+            var cookies = [];
+            try {
+                var hdrs = login.getHeaders(false);
+                if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+                    Object.keys(hdrs).forEach(function(k) {
+                        if (k.toLowerCase() === 'set-cookie') {
+                            var v = hdrs[k];
+                            (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                                var p = c.split(';')[0].trim();
+                                if (p) cookies.push(p);
+                            });
+                        }
+                    });
+                }
+            } catch(e) {}
+            if (cookies.length === 0) {
+                try {
+                    var raw = login.getHeaders(true);
+                    if (typeof raw !== 'string') raw = String(raw);
+                    (raw.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+                        var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+                        if (p) cookies.push(p);
+                    });
+                } catch(e) {}
+            }
+            if (cookies.length === 0) {
+                throw new Error('Login failed (HTTP ' + loginCode + '). No cookies. URL=' + url + ' user=' + user + '. Set {$VDCM.URL}/{$VDCM.PASS} in host macros.');
+            }
+            
+            // Fetch alarm footer
+            var api = new HttpRequest();
+            try { api.setopt(64, 0); } catch(e) {}
+            try { api.setopt(81, 0); } catch(e) {}
+            api.addHeader('Cookie: ' + cookies.join('; '));
+            var response = api.get(url + '/load_alarm_footer');
+            
+            if (!response) {
+                throw new Error('vDCM /load_alarm_footer returned empty response.');
+            }
+            
+            // Parse JavaScript assignment patterns from the returned HTML/JS snippet
+            var alarmMatch  = response.match(/device_status'\)\.textContent\s*=\s*'([^']*)'/);
+            var stateMatch  = response.match(/device_state'\)\.textContent\s*=\s*'([^']*)'/);
+            var vdcmMatch   = response.match(/vdcm_state'\)\.textContent\s*=\s*'([^']*)'/);
+            
+            var alarmCount  = alarmMatch ? parseInt(alarmMatch[1], 10) : -1;
+            var deviceState = stateMatch ? stateMatch[1] : 'unknown';
+            var vdcmState   = vdcmMatch  ? vdcmMatch[1]  : 'unknown';
+            
+            return JSON.stringify({
+                alarm_count:  alarmCount,
+                device_state: deviceState,
+                vdcm_state:   vdcmState
+            });
+          description: 'Logs into vDCM and queries GET /load_alarm_footer for device health. Returns JSON: {"alarm_count":0,"device_state":"Active - Role: Standalone", "vdcm_state":"Active"}. alarm_count = number of active alarms (0 = no alarms). device_state = operational role string. vdcm_state = "Active" when device is healthy. alarm_count of -1 means the field was not found in the response.'
+          timeout: 30s
+        - uuid: fcd1b48d233e43e590116dc215e0337d
+          name: 'vDCM state'
+          type: DEPENDENT
+          key: vdcm.device.vdcm_state
+          history: 90d
+          value_type: TEXT
+          description: 'vDCM operational state string (e.g. "Active"). Sourced from /load_alarm_footer vdcm_state element. Expected value: "Active" during normal operation.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.vdcm_state
+          master_item:
+            key: vdcm.device.status
+          triggers:
+            - uuid: 297193956d414dad87ed88cdebd2f4b2
+              expression: 'last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.device.vdcm_state)<>"Active" and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.device.vdcm_state)<>"unknown"'
+              name: 'vDCM: state is not Active (current: {ITEM.LASTVALUE})'
+              priority: HIGH
+              description: 'The vDCM state is not "Active" (current: {ITEM.LASTVALUE}). Device may be in fault, standby, or restarting state. Log in to {$VDCM.URL} to investigate. Note: "unknown" (HTTP parse failure) is excluded to prevent false alarms.'
+        - uuid: b2c3d4e5f6a7489490b2c3d4e5f6a7b8
+          name: 'vDCM all input stream bitrates (HTTP API)'
+          type: SCRIPT
+          key: vdcm.input.bitrates
+          history: 7d
+          value_type: TEXT
+          params: |
+            var url = '{$VDCM.URL}'.replace(/\/+$/, '');
+            var user = '{$VDCM.USER}';
+            var pass = '{$VDCM.PASS}';
+            var cards = '{$VDCM.INPUT.CARDS}'.split(',').map(function(s){return s.trim();}).filter(Boolean);
+            
+            if (!url || url.indexOf('http') !== 0) {
+                throw new Error('Invalid {$VDCM.URL}: "' + url + '". Set https://hostname[:port] in host macros.');
+            }
+            if (cards.length === 0) {
+                throw new Error('No input cards configured. Set {$VDCM.INPUT.CARDS} (e.g. T_I:1:4,T_I:1:65532).');
+            }
+            
+            // Login — POST /login_handler?came_from=/ → HTTP 302 + Set-Cookie
+            var login = new HttpRequest();
+            try { login.setopt(64, 0); } catch(e) {}  // CURLOPT_SSL_VERIFYPEER
+            try { login.setopt(81, 0); } catch(e) {}  // CURLOPT_SSL_VERIFYHOST
+            try { login.setopt(52, 0); } catch(e) {}  // CURLOPT_FOLLOWLOCATION: don't follow 302
+            login.addHeader('Content-Type: application/x-www-form-urlencoded');
+            login.post(
+                url + '/login_handler?came_from=%2F',
+                'login=' + encodeURIComponent(user) +
+                '&password=' + encodeURIComponent(pass) +
+                '&login_button=Login'
+            );
+            var loginCode = login.getStatus();
+            
+            var cookies = [];
+            try {
+                var hdrs = login.getHeaders(false);
+                if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+                    Object.keys(hdrs).forEach(function(k) {
+                        if (k.toLowerCase() === 'set-cookie') {
+                            var v = hdrs[k];
+                            (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                                var p = c.split(';')[0].trim();
+                                if (p) cookies.push(p);
+                            });
+                        }
+                    });
+                }
+            } catch(e) {}
+            if (cookies.length === 0) {
+                try {
+                    var raw = login.getHeaders(true);
+                    if (typeof raw !== 'string') raw = String(raw);
+                    (raw.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+                        var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+                        if (p) cookies.push(p);
+                    });
+                } catch(e) {}
+            }
+            if (cookies.length === 0) {
+                throw new Error('Login failed (HTTP ' + loginCode + '). No cookies. URL=' + url + ' user=' + user + '. Check {$VDCM.URL}/{$VDCM.PASS}.');
+            }
+            
+            var cookieHdr = cookies.join('; ');
+            var allInputs = [];
+            var seenKeys = {};
+            
+            // Auto-name: query opennode2 service tree to resolve "Program NNN" by SID.
+            // Builds a map of SID → channel name for SIDs that appear exactly once in the tree
+            // (unique SIDs are unambiguous; SID=1 often appears in many separate TS streams so is excluded).
+            var autoSidMap = {};
+            var procBitrate = {};  // Processing service name → kbps (guard fallback for ABR channels)
+            try {
+                var procNode = '{$VDCM.PROC.NODE}';
+                var svcReq = new HttpRequest();
+                try { svcReq.setopt(64, 0); } catch(e) {}
+                try { svcReq.setopt(81, 0); } catch(e) {}
+                svcReq.addHeader('Content-Type: application/x-www-form-urlencoded');
+                svcReq.addHeader('Cookie: ' + cookieHdr);
+                var svcResp = svcReq.post(
+                    url + '/service/overview/opennode2',
+                    'xID=' + encodeURIComponent(procNode) + '&type=S'
+                );
+                var svcNodes = JSON.parse(svcResp);
+                // Count occurrences of each SID across all service nodes
+                var sidCount = {};
+                svcNodes.forEach(function(n) {
+                    var m = (n.title || '').match(/\((\d+)\)/);
+                    if (m) sidCount[m[1]] = (sidCount[m[1]] || 0) + 1;
+                });
+                // Build map only for unique SIDs (count === 1)
+                // Also build procBitrate: serviceName → kbps.
+                // Key = full channel name before first '(' (e.g. "EBCFNews QT", "FTV NEWS").
+                // Also add hash-stripped variant (e.g. "TVBSN SRT#1" → also stores "TVBSN SRT")
+                // so that input "TVBSN SRT" can do a direct lookup.
+                svcNodes.forEach(function(n) {
+                    var m = (n.title || '').match(/\((\d+)\)/);
+                    if (m && sidCount[m[1]] === 1) {
+                        var svcName = (n.title || '').split('(')[0].trim();
+                        if (svcName) autoSidMap[m[1]] = svcName;
+                    }
+                    // procBitrate keys: full-name AND hash-stripped variant
+                    var bm = (n.tooltip || '').match(/cur:\s*([\d.]+)/);
+                    if (bm) {
+                        var kbps = Math.round(parseFloat(bm[1]) * 1000000 / 1000);
+                        var fullName = (n.title || '').split('(')[0].trim();
+                        if (fullName) {
+                            procBitrate[fullName] = kbps;
+                            // Strip trailing "#N" so "TVBSN SRT#1" also registers as "TVBSN SRT"
+                            var noHash = fullName.replace(/#\d+$/, '').trim();
+                            if (noHash !== fullName && noHash) procBitrate[noHash] = kbps;
+                        }
+                    }
+                });
+            } catch(e) {}
+            
+            // Manual override: resolve remaining "Program NNN" via {$INPUT.NAME.MAP}.
+            // Key = "IP:Port:SID" (e.g. "230.0.0.26:3539:503"), value = channel name.
+            // Only needed for streams with non-unique SIDs or not in the service tree.
+            var nameMap = {};
+            try { nameMap = JSON.parse('{$INPUT.NAME.MAP}'); } catch(e) {}
+            
+            cards.forEach(function(card) {
+                // Step 1: Trigger server-side data refresh for this card (returns 204)
+                var ref = new HttpRequest();
+                try { ref.setopt(64, 0); } catch(e) {}
+                try { ref.setopt(81, 0); } catch(e) {}
+                ref.addHeader('Cookie: ' + cookieHdr);
+                ref.get(url + '/bitrates/input/refresh?s_xID=' + encodeURIComponent(card) + '&filter=Service');
+            
+                // Step 2: Fetch the data table rows
+                var api = new HttpRequest();
+                try { api.setopt(64, 0); } catch(e) {}
+                try { api.setopt(81, 0); } catch(e) {}
+                api.addHeader('Content-Type: application/x-www-form-urlencoded');
+                api.addHeader('Cookie: ' + cookieHdr);
+                var resp = api.post(
+                    url + '/bitrates/input/get_rows?s_xID=' + encodeURIComponent(card) + '&filter=Service',
+                    'table_id=bitrates_serv_input_table&paging_info_bitrates_serv_input_table=' +
+                    encodeURIComponent('{"start_row":0,"rows_to_show":500}')
+                );
+            
+                if (!resp) return;
+            
+                // Extract tbl_data_bitrates_serv_input_table='[...]' from the JS/XML response
+                var marker = "tbl_data_bitrates_serv_input_table='";
+                var idx = resp.indexOf(marker);
+                if (idx < 0) return;
+                var start = idx + marker.length;
+                var end = resp.indexOf("';", start);
+                if (end < 0) end = resp.indexOf("'\n", start);
+                if (end < 0) return;
+            
+                // Decode HTML entities (&quot; → ", &amp; → &, &#39; → ', &lt; → <, &gt; → >)
+                var encoded = resp.substring(start, end);
+                var decoded = encoded
+                    .replace(/&quot;/g, '"')
+                    .replace(/&amp;/g, '&')
+                    .replace(/&#39;/g, "'")
+                    .replace(/&lt;/g, '<')
+                    .replace(/&gt;/g, '>');
+            
+                var rows;
+                try { rows = JSON.parse(decoded); } catch(e) { return; }
+            
+                // columns: [0]App [1]Port [2]IP/VLAN [3]UDP_Port [4]ON_ID [5]TS_ID_link
+                //          [6]TS_ID_link [7]SID [8]Name [9]Current [10]Avg [11]Min [12]Peak [13]Detail
+                rows.forEach(function(row) {
+                    var vals = row.values || [];
+                    var name = (vals[8] || '').trim();
+                    var sid  = (vals[7] || '').trim();
+                    var ip   = (vals[2] || '').trim();
+                    var port = (vals[3] || '').trim();
+                    var curStr = (vals[9] || '0').trim();
+                    var cur  = Math.round(parseFloat(curStr) * 1000000);
+                    if (isNaN(cur)) cur = 0;
+            
+                    if (!name) return;
+            
+                    // If vDCM shows generic "Program NNN" (unnamed SID), resolve real channel name:
+                    // 1. Auto: look up unique SID in service tree (autoSidMap built from opennode2 above)
+                    // 2. Manual fallback: {$INPUT.NAME.MAP} macro keyed by "IP:Port:SID"
+                    if (/^Program\s+\d+$/i.test(name)) {
+                        if (autoSidMap[sid]) {
+                            name = autoSidMap[sid];
+                        } else {
+                            var mapKey = ip + ':' + port + ':' + sid;
+                            if (nameMap[mapKey]) name = nameMap[mapKey];
+                        }
+                    }
+            
+                    // Unique key: name + ip:port avoids collision when same name appears on different inputs
+                    var uniqKey = name + '|' + ip + ':' + port;
+                    if (seenKeys[uniqKey]) return;
+                    seenKeys[uniqKey] = true;
+            
+                    // Sanitize key for Zabbix item key (alphanumeric, dot, underscore, hyphen only)
+                    var zbxKey = uniqKey.replace(/[^a-zA-Z0-9._-]/g, '_');
+            
+                    // Human-readable source: RTMP push streams show '-' as IP → label as port:NNN
+                    var src = (ip === '-' || ip === '') ? ('port:' + port) : (ip + ':' + port);
+            
+                    allInputs.push({ key: zbxKey, name: name, ip: ip, port: port, src: src, bps: cur, card: card });
+                });
+            });
+            
+            // Query Port 5 output bitrate table to check if each INPUT stream's
+            // corresponding OUTPUT channel is active.
+            // Guard logic: input low + output stopped (= 0) = real fault;
+            //              input low + output running (> 0) = VBR fluctuation, suppress.
+            // Matching: exact name OR prefix-before-' (' match against output col[10].
+            // out_kbps = -1 → no output match found → guard disabled (fires on threshold alone).
+            var outCard = '{$VDCM.OUTPUT.CARD}';
+            var outByPrefix = {};  // channelPrefix → total kbps (before first ' (' in name)
+            var outByExact  = {};  // exactName → total kbps (exact SRT passthrough row names)
+            var outByBase   = {};  // baseName  → total kbps (SRT name with trailing " SRT" / " SRT#N" stripped)
+            if (outCard) {
+                try {
+                    var outRef = new HttpRequest();
+                    try { outRef.setopt(64, 0); } catch(e) {}
+                    try { outRef.setopt(81, 0); } catch(e) {}
+                    outRef.addHeader('Cookie: ' + cookieHdr);
+                    outRef.get(url + '/bitrates/output/refresh?s_xID=' + encodeURIComponent(outCard) + '&filter=Service');
+                    var outApi = new HttpRequest();
+                    try { outApi.setopt(64, 0); } catch(e) {}
+                    try { outApi.setopt(81, 0); } catch(e) {}
+                    outApi.addHeader('Content-Type: application/x-www-form-urlencoded');
+                    outApi.addHeader('Cookie: ' + cookieHdr);
+                    var outResp = outApi.post(
+                        url + '/bitrates/output/get_rows?s_xID=' + encodeURIComponent(outCard) + '&filter=Service',
+                        'table_id=bitrates_serv_output_table&paging_info_bitrates_serv_output_table=' +
+                        encodeURIComponent('{"start_row":0,"rows_to_show":500}')
+                    );
+                    if (outResp) {
+                        var outMarker = "tbl_data_bitrates_serv_output_table='";
+                        var outIdx = outResp.indexOf(outMarker);
+                        if (outIdx >= 0) {
+                            var outStart = outIdx + outMarker.length;
+                            var outEnd = outResp.indexOf("';", outStart);
+                            if (outEnd < 0) outEnd = outResp.indexOf("'\n", outStart);
+                            if (outEnd >= 0) {
+                                var outEncoded = outResp.substring(outStart, outEnd);
+                                var outDecoded = outEncoded
+                                    .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+                                    .replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+                                var outRows = JSON.parse(outDecoded);
+                                // col[10] = channel name (e.g. "DayStarMain (1920x1080p...)" or "EBCNews SRT")
+                                // col[11] = current Mbps
+                                outRows.forEach(function(row) {
+                                    var vals = row.values || [];
+                                    var rowName = (vals[10] || '').trim();
+                                    var curMbps = parseFloat((vals[11] || '0').trim());
+                                    if (!rowName || isNaN(curMbps)) return;
+                                    // Skip MR resolution rows (e.g. "FTV-HD (1920x1080p30 @ 5000 kbps) (MR)").
+                                    // These are ABR/HLS outputs that go through a different port — always cur=0
+                                    // on Port 5 even when encoding is healthy. Including them causes false guards.
+                                    if (/ @ \d+ kbps\)/.test(rowName)) return;
+                                    var curKbps = Math.round(curMbps * 1000);
+                                    // Exact match ("EBCNews SRT", "CTSMainSRT", "EBCF", "TVBSN SRT" etc.)
+                                    outByExact[rowName] = (outByExact[rowName] || 0) + curKbps;
+                                    // Prefix before ' (' (for any remaining grouped names)
+                                    var sp = rowName.indexOf(' (');
+                                    if (sp >= 0) {
+                                        var prefix = rowName.substring(0, sp);
+                                        outByPrefix[prefix] = (outByPrefix[prefix] || 0) + curKbps;
+                                    }
+                                    // Base name: strip trailing " SRT" or " SRT#N" so that input
+                                    // "FTV-HD" can match output "FTV-HD SRT" (vDCM SRT passthrough naming).
+                                    var baseName = rowName.replace(/ SRT(#\d+)?$/, '').trim();
+                                    if (baseName && baseName !== rowName) {
+                                        outByBase[baseName] = (outByBase[baseName] || 0) + curKbps;
+                                    }
+                                });
+                            }
+                        }
+                    }
+                } catch(e) {}
+            }
+            
+            // Annotate each input stream with its corresponding output bitrate (for guard condition)
+            // getProc: look up Processing service bitrate for input name n.
+            // Tries: (1) exact n, (2) n with " SRT" suffix stripped (SRT passthrough channels
+            //        like "EBCNews SRT" input → "EBCNews" processing service).
+            // Manual INPUT name → Processing service name override map
+            var inputProcMap = {};
+            try { inputProcMap = JSON.parse('{$INPUT.PROC.NAME.MAP}'); } catch(e) {}
+            
+            function normStr(s) { return s.toLowerCase().replace(/[^a-z0-9]/g, ''); }
+            function cpLen(a, b) {
+                var n = Math.min(a.length, b.length);
+                for (var i = 0; i < n; i++) { if (a[i] !== b[i]) return i; }
+                return n;
+            }
+            
+            function getProc(n) {
+                // 0. Manual override via {$INPUT.PROC.NAME.MAP} — highest priority,
+                //    overrides all auto-matching.
+                //    Use proc name to force a mapping (e.g. "SET iNEWS"→"SET-88"),
+                //    or use "" (empty string) to mark as passthrough/no-proc (returns -1,
+                //    disables proc fallback so Port5 drop will fire directly).
+                if (n in inputProcMap) {
+                    var mapped = inputProcMap[n];
+                    if (mapped === '') return -1;
+                    if (mapped in procBitrate) return procBitrate[mapped];
+                }
+                // 1. Exact match
+                if (n in procBitrate) return procBitrate[n];
+                // 2. Strip " SRT" suffix (e.g. "EBCNews SRT" → "EBCNews")
+                var stripped = n.replace(/ SRT$/i, '').trim();
+                if (stripped !== n && stripped in procBitrate) return procBitrate[stripped];
+                // 3. Space normalization (e.g. "EBCNews QT" → matches "EBCNewsQT")
+                var noSpace = n.replace(/\s+/g, '');
+                for (var k in procBitrate) {
+                    if (k.replace(/\s+/g, '') === noSpace) return procBitrate[k];
+                }
+                // 4. Normalized prefix overlap (lowercase + strip non-alphanumeric).
+                //    Handles: abbreviations ("FTV" → "FTV-HD"), truncated API names
+                //    ("CTS News Information Channe" → "CTSNewsQT"), space/case variants.
+                //    Requires ≥60% overlap of common prefix relative to shorter normalized name.
+                //    On tie, prefer the shorter processing service name (most specific match).
+                var normN = normStr(n);
+                var bestScore = 0.6;
+                var bestKey = null;
+                var bestKLen = 999;
+                for (var pk in procBitrate) {
+                    var normK = normStr(pk);
+                    var shorter = Math.min(normN.length, normK.length);
+                    if (shorter < 3) continue;
+                    var score = cpLen(normN, normK) / shorter;
+                    if (score > bestScore || (score === bestScore && normK.length < bestKLen)) {
+                        bestScore = score;
+                        bestKey = pk;
+                        bestKLen = normK.length;
+                    }
+                }
+                if (bestKey !== null) return procBitrate[bestKey];
+                return -1;
+            }
+            
+            allInputs.forEach(function(inp) {
+                var n = inp.name;
+                // Port 5 SRT output lookup (MR rows already excluded from outBy* maps)
+                var port5Val = -1;
+                if (n in outByExact)       port5Val = outByExact[n];
+                else if (n in outByPrefix)  port5Val = outByPrefix[n];
+                else if (n in outByBase)    port5Val = outByBase[n];
+            
+                // Processing layer lookup (fallback for ABR channels and passive SRT streams)
+                var procVal = getProc(n);
+            
+                // Guard decision:
+                //  Port5 > 0                  → suppress (SRT actively sending)
+                //  Port5 = 0 AND Proc > 0     → suppress (SRT passive/standby BUT encoding healthy)
+                //  Port5 = 0 AND Proc = 0     → 0  (fire: both stopped → real fault)
+                //  Port5 = 0 AND Proc = -1    → -1 (guard disabled: Port5 passive, no proc ref)
+                //  Port5 = -1 AND Proc >= 0   → use Proc (no SRT match, use Processing health)
+                //  Port5 = -1 AND Proc = -1   → -1 (guard disabled, fires on threshold)
+                if (port5Val > 0) {
+                    inp.out_kbps = port5Val;
+                } else if (port5Val === 0 && procVal > 0) {
+                    inp.out_kbps = procVal;   // SRT passive but encoding healthy → suppress
+                } else if (port5Val === 0 && procVal === 0) {
+                    inp.out_kbps = 0;         // Both stopped → fire
+                } else if (port5Val === 0) {  // procVal = -1
+                    inp.out_kbps = -1;        // SRT passive, no proc reference → guard disabled
+                } else if (procVal >= 0) {
+                    inp.out_kbps = procVal;   // No Port5 match, use Processing (0 or >0)
+                } else {
+                    inp.out_kbps = -1;
+                }
+            });
+            
+            if (allInputs.length === 0) {
+                throw new Error('No input streams found. Cards: "' + cards.join(',') + '". Verify cards are active and {$VDCM.INPUT.CARDS} is correct.');
+            }
+            
+            return JSON.stringify(allInputs);
+          description: 'Queries real-time INPUT source stream bitrates from all cards in {$VDCM.INPUT.CARDS}. Uses /bitrates/input/refresh (triggers server-side data collection) then /bitrates/input/get_rows to fetch the data table. Returns JSON array: [{"key":"...","name":"...","ip":"...","port":"...","bps":...},...]. Each entry = one unique input stream (IP:port combination). This is the master item for input stream LLD discovery and per-stream bitrate items. If empty: check {$VDCM.INPUT.CARDS}, verify cards have active input streams. If login fails: check {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}. Verified on litv_tran2 (211.21.3.210): T_I:1:4 = 14 streams, T_I:1:65532 = 11 streams.'
+          timeout: 30s
+          triggers:
+            - uuid: c3d4e5f6a7b8490591c3d4e5f6a7b8c9
+              expression: 'nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.input.bitrates,5m)=1'
+              name: 'vDCM: no input bitrate data for 5+ minutes (check {$VDCM.INPUT.CARDS})'
+              priority: HIGH
+              description: 'No input bitrate data collected for 5+ minutes. Possible causes: 1. {$VDCM.INPUT.CARDS} macro has wrong card IDs for this device. 2. vDCM login failed - check {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}. 3. Device unreachable (network / firewall issue). All input stream monitors are effectively blind until this clears. Find correct card IDs: open {$VDCM.URL}/bitrates/input in DevTools, check s_xID in /bitrates/input/get_rows XHR call.'
+        - uuid: 3c4d5e6f7a8b4901a43c4d5e6f7a8b9c
+          name: 'vDCM stopped output services count'
+          type: DEPENDENT
+          key: vdcm.output.stopped_count
+          history: 90d
+          description: 'Number of OUTPUT encoding services currently reporting bitrate = 0. Value > 0 means at least one encoding service has stopped. Used as a guard condition: INPUT bitrate alerts (low/critically-low) only fire when this counter is > 0, ensuring alerts reflect actual output impact. If all outputs are healthy, INPUT fluctuations are suppressed.'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var data = JSON.parse(value);
+                  return String(data.filter(function(s) { return s.bps === 0; }).length);
+          master_item:
+            key: vdcm.services.bitrates
+        - uuid: b3c4d5e6f7a84b2c9ab3c4d5e6f7a8b9
+          name: 'vDCM Port 5 SRT output stream bitrates (HTTP API)'
+          type: SCRIPT
+          key: vdcm.port5.bitrates
+          history: 7d
+          value_type: TEXT
+          params: |
+            var url  = '{$VDCM.URL}'.replace(/\/+$/, '');
+            var user = '{$VDCM.USER}';
+            var pass = '{$VDCM.PASS}';
+            var card = '{$VDCM.OUTPUT.CARD}';
+            
+            if (!url || url.indexOf('http') !== 0) {
+                throw new Error('Invalid {$VDCM.URL}: "' + url + '"');
+            }
+            
+            var login = new HttpRequest();
+            try { login.setopt(64, 0); } catch(e) {}
+            try { login.setopt(81, 0); } catch(e) {}
+            try { login.setopt(52, 0); } catch(e) {}
+            login.addHeader('Content-Type: application/x-www-form-urlencoded');
+            login.post(
+                url + '/login_handler?came_from=%2F',
+                'login=' + encodeURIComponent(user) +
+                '&password=' + encodeURIComponent(pass) +
+                '&login_button=Login'
+            );
+            var loginCode = login.getStatus();
+            
+            var cookies = [];
+            try {
+                var hdrs = login.getHeaders(false);
+                if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+                    Object.keys(hdrs).forEach(function(k) {
+                        if (k.toLowerCase() === 'set-cookie') {
+                            var v = hdrs[k];
+                            (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                                var p = c.split(';')[0].trim();
+                                if (p) cookies.push(p);
+                            });
+                        }
+                    });
+                }
+            } catch(e) {}
+            if (cookies.length === 0) {
+                try {
+                    var raw = login.getHeaders(true);
+                    if (typeof raw !== 'string') raw = String(raw);
+                    (raw.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+                        var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+                        if (p) cookies.push(p);
+                    });
+                } catch(e) {}
+            }
+            if (cookies.length === 0) {
+                throw new Error('Login failed (HTTP ' + loginCode + '). Check {$VDCM.URL}/{$VDCM.PASS}.');
+            }
+            
+            var api = new HttpRequest();
+            try { api.setopt(64, 0); } catch(e) {}
+            try { api.setopt(81, 0); } catch(e) {}
+            api.addHeader('Content-Type: application/x-www-form-urlencoded');
+            api.addHeader('Cookie: ' + cookies.join('; '));
+            var result = api.post(
+                url + '/service/overview/opennode2',
+                'xID=' + encodeURIComponent(card)
+            );
+            
+            if (!result) {
+                throw new Error('Port 5 opennode2 empty response. Check {$VDCM.OUTPUT.CARD}: "' + card + '".');
+            }
+            
+            var data = JSON.parse(result);
+            var streams = [];
+            data.forEach(function(item) {
+                // TS_S  = SRT output stream (bitrate in tooltip)
+                // TS_S_P = SRT passthrough stream (no tooltip cur, but has ON/OFF in title)
+                var isStream = item.nodetype === 'TS_S' || item.nodetype === 'TS_S_P';
+                if (isStream) {
+                    var m = (item.tooltip || '').match(/cur:\s*([\d.]+)/);
+                    var bps = m ? Math.round(parseFloat(m[1]) * 1000000) : 0;
+                    // Extract name: everything before the first " ("
+                    var sp = (item.title || '').indexOf(' (');
+                    var name = sp >= 0 ? item.title.substring(0, sp) : (item.title || 'unknown');
+                    // ON=1 if title contains " ON " (e.g. "TVBSN SRT (1) ON ID:1...")
+                    var on = (item.title || '').indexOf(' ON ') >= 0 ? 1 : 0;
+                    streams.push({ name: name, bps: bps, on: on });
+                }
+            });
+            
+            if (streams.length === 0) {
+                throw new Error('No TS_S/TS_S_P streams found on Port 5 (' + card + '). Verify card xID or stream type.');
+            }
+            
+            return JSON.stringify(streams);
+          description: 'Queries Port 5 ({$VDCM.OUTPUT.CARD}) SRT output stream bitrates via opennode2. Filters TS_S type nodes, extracts bitrate from tooltip "cur: X.X" field. Returns JSON array: [{"name":"TVBSN SRT","bps":9800000}, ...]. Stream names are extracted as the prefix before the first " (" in the title (e.g. "TVBSN SRT (1) ON ID:1..." → "TVBSN SRT"). This is the master item for Port 5 SRT LLD discovery. Verified streams on litv_tran1/tran2: TVBSN SRT, EBCNews SRT, EBCF, FTV-HD SRT.'
+          timeout: 30s
+          triggers:
+            - uuid: c4d5e6f7a8b94c3dabc4d5e6f7a8b9ca
+              expression: 'nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.bitrates,5m)=1'
+              name: 'vDCM: no Port 5 SRT data for 5+ minutes'
+              priority: HIGH
+              description: 'No Port 5 SRT output data for 5+ minutes. Port 5 ({$VDCM.OUTPUT.CARD}) may be unreachable or all SRT streams have stopped.'
+        - uuid: e1f2a3b4c5d6470891e1f2a3b4c5d6e7
+          name: 'vDCM processing alarms (HTTP API)'
+          type: SCRIPT
+          key: vdcm.processing.alarms
+          history: 90d
+          value_type: TEXT
+          params: |
+            var url  = '{$VDCM.URL}'.replace(/\/+$/, '');
+            var user = '{$VDCM.USER}';
+            var pass = '{$VDCM.PASS}';
+            var cards = '{$VDCM.PROC.CARDS}'.split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+            
+            // Login — POST /login_handler?came_from=/ → HTTP 302 + Set-Cookie
+            var login = new HttpRequest();
+            try { login.setopt(64, 0); } catch(e) {}
+            try { login.setopt(81, 0); } catch(e) {}
+            try { login.setopt(52, 0); } catch(e) {}
+            login.addHeader('Content-Type: application/x-www-form-urlencoded');
+            login.post(
+                url + '/login_handler?came_from=%2F',
+                'login=' + encodeURIComponent(user) +
+                '&password=' + encodeURIComponent(pass) +
+                '&login_button=Login'
+            );
+            var loginCode = login.getStatus();
+            
+            var cookies = [];
+            try {
+                var hdrs = login.getHeaders(false);
+                if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+                    Object.keys(hdrs).forEach(function(k) {
+                        if (k.toLowerCase() === 'set-cookie') {
+                            var v = hdrs[k];
+                            (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                                var p = c.split(';')[0].trim();
+                                if (p) cookies.push(p);
+                            });
+                        }
+                    });
+                }
+            } catch(e) {}
+            if (cookies.length === 0) {
+                try {
+                    var rawHdr = login.getHeaders(true);
+                    if (typeof rawHdr !== 'string') rawHdr = String(rawHdr);
+                    (rawHdr.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+                        var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+                        if (p) cookies.push(p);
+                    });
+                } catch(e) {}
+            }
+            if (cookies.length === 0) {
+                throw new Error('Login failed (HTTP ' + loginCode + '). Check {$VDCM.URL}/{$VDCM.USER}/{$VDCM.PASS}.');
+            }
+            
+            var cookieHdr = cookies.join('; ');
+            
+            // Noise alarm types to suppress — permanent background on VBR/RTMP streams.
+            // PTS Discontinuity: VBR RTMP bitrate fluctuations (Quality class, always present).
+            // NOTE: TS Stream Loss / UDP Stream Loss intentionally NOT suppressed here.
+            // Empty port slot alarms are already filtered by the service-name check above
+            // (empty slots have no service name → skipped by the !svc guard).
+            // Keeping TS/UDP Stream Loss active ensures real RTMP source failures
+            // (source disconnects on named channels) DO trigger this alarm.
+            var NOISE_ALARMS = ['PTS Discontinuity'];
+            
+            function isNoise(alarmName) {
+                for (var i = 0; i < NOISE_ALARMS.length; i++) {
+                    if (alarmName.indexOf(NOISE_ALARMS[i]) >= 0) return true;
+                }
+                return false;
+            }
+            
+            function stripHtml(s) { return String(s || '').replace(/<[^>]+>/g, '').trim(); }
+            
+            // Fetch detail alarms for a service xID; returns array of non-noise alarm names.
+            function getRealAlarms(xid) {
+                var det = new HttpRequest();
+                try { det.setopt(64, 0); } catch(e) {}
+                try { det.setopt(81, 0); } catch(e) {}
+                det.addHeader('Content-Type: application/x-www-form-urlencoded');
+                det.addHeader('Cookie: ' + cookieHdr);
+                var dresp = det.post(
+                    url + '/status/detail/get_rows?s_xID=' + encodeURIComponent(xid) + '&s_type=S&filter=Service',
+                    'table_id=status_detail_table&paging_info_status_detail_table=' +
+                    encodeURIComponent('{"start_row":0,"rows_to_show":50}')
+                );
+                if (!dresp) return ['unknown'];
+                var dm = dresp.indexOf("tbl_data_status_detail_table='");
+                if (dm < 0) return [];
+                var ds = dm + "tbl_data_status_detail_table='".length;
+                var de = dresp.indexOf("';", ds);
+                if (de < 0) return [];
+                var denc = dresp.substring(ds, de)
+                    .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+                    .replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+                    .replace(/\\'/g, "'");
+                var drows;
+                try { drows = JSON.parse(denc); } catch(e) { return ['parse_err']; }
+                var real = [];
+                drows.forEach(function(dr) {
+                    var dv = dr.values || [];
+                    // v[0]=severity, v[1]=alarm name, v[3]=status(Active/Cleared)
+                    var aname = stripHtml(dv[1]);
+                    var astatus = stripHtml(dv[3]);
+                    if (!aname || /^fi-/.test(aname)) return;
+                    if (astatus && astatus.indexOf('Cleared') >= 0) return;
+                    if (isNoise(aname)) return;
+                    real.push(aname);
+                });
+                return real;
+            }
+            
+            var allAlarms = [];
+            
+            cards.forEach(function(card) {
+                var api = new HttpRequest();
+                try { api.setopt(64, 0); } catch(e) {}
+                try { api.setopt(81, 0); } catch(e) {}
+                api.addHeader('Content-Type: application/x-www-form-urlencoded');
+                api.addHeader('Cookie: ' + cookieHdr);
+                var resp = api.post(
+                    url + '/status/processing/get_rows?s_xID=' + encodeURIComponent(card),
+                    'table_id=processing_table&paging_info_processing_table=' +
+                    encodeURIComponent('{"start_row":0,"rows_to_show":500}')
+                );
+                if (!resp) return;
+                if (resp.indexOf('No Processing Alarms') >= 0) return;
+            
+                var marker = "tbl_data_processing_table='";
+                var idx = resp.indexOf(marker);
+                if (idx < 0) return;
+                var start = idx + marker.length;
+                var end = resp.indexOf("';", start);
+                if (end < 0) return;
+            
+                var encoded = resp.substring(start, end);
+                var decoded = encoded
+                    .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+                    .replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+            
+                var rows;
+                try { rows = JSON.parse(decoded); } catch(e) { return; }
+            
+                // vDCM processing overview table columns:
+                // v[0]=severity class, v[1]=board(vMFP 2), v[2]=count,
+                // v[3]=service name, v[4]=count(dup), v[5]=fi-summary icon, v[6]=detail URL
+                rows.forEach(function(row) {
+                    var v = row.values || [];
+                    var svc = stripHtml(v[3]);
+                    // Skip output-level rows like "DayStarMain (1920x1080p29.97 @ 5000 kbps)"
+                    if (/\(\d+x\d+/.test(svc)) return;
+                    // Skip icon/empty/pure-number cells
+                    if (!svc || /^fi-/.test(svc) || /^\d+$/.test(svc)) return;
+            
+                    // Extract detail xID from v[6] URL: ?s_xID=T_T:2:65534:*:40:1&...
+                    var detailUrl = stripHtml(v[6]);
+                    var xidMatch = detailUrl.match(/[?&]s_xID=([^&]+)/);
+                    if (!xidMatch) {
+                        // No detail URL available — report service name only
+                        allAlarms.push(svc);
+                        return;
+                    }
+                    var xid = decodeURIComponent(xidMatch[1]);
+                    var realAlarms = getRealAlarms(xid);
+                    if (realAlarms.length === 0) return; // all noise, suppress
+                    allAlarms.push(svc + ': ' + realAlarms.join(', '));
+                });
+            });
+            
+            if (allAlarms.length === 0) return 'OK';
+            var seen = {};
+            var unique = allAlarms.filter(function(a) {
+                if (seen[a]) return false;
+                seen[a] = true;
+                return true;
+            });
+            return unique.join(' | ');
+          description: 'Queries processing-layer alarms from all input cards in {$VDCM.PROC.CARDS} via POST /status/processing/get_rows (Web UI API). Returns "OK" when no processing alarms. Returns comma-separated list of affected channels with alarm type when faults exist, e.g. "DayStarMain: TS Sync Loss, EHS2RTMP: TS Stream Loss". Auth: POST /login_handler?came_from=/ → session cookie. Processing alarms = real encoding faults. Only PTS Discontinuity (VBR RTMP quality noise) is suppressed. TS Stream Loss and UDP Stream Loss on NAMED channels are treated as real faults (empty slot alarms are already filtered by service-name check). Note: REST API (/api/v2/AlarmHistory) returns 204 on these units (not enabled).'
+          timeout: 30s
+          triggers:
+            - uuid: f2a3b4c5d6e7481982f2a3b4c5d6e7f8
+              expression: 'count(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.processing.alarms,5m,"ne","OK")>=2'
+              name: 'vDCM: processing fault — {ITEM.LASTVALUE}'
+              priority: HIGH
+              description: 'Processing-layer fault(s) detected on the vDCM device. Affected channels shown in {ITEM.LASTVALUE}, e.g. "GOODTV2: Service Loss, Video Input Loss". With delay=2m, requires 2 consecutive non-OK polls (~4 min sustained) to fire. Source: POST /status/processing/get_rows per card in {$VDCM.PROC.CARDS}, then /status/detail/get_rows per alarmed service. Noise suppressed: PTS Discontinuity only (VBR RTMP). TS Stream Loss / UDP Stream Loss on named channels = real RTMP source failure and WILL fire this trigger. Empty slot alarms are filtered by service-name check (no name). Investigate at {$VDCM.URL} → Status > Processing.'
+        - uuid: a1b2c3d4e5f6478390a1b2c3d4e5f648
+          name: 'vDCM processing service health heartbeat (HTTP API)'
+          type: SCRIPT
+          key: vdcm.services.bitrates
+          history: 7d
+          value_type: TEXT
+          params: |
+            var url = '{$VDCM.URL}'.replace(/\/+$/, '');
+            var user = '{$VDCM.USER}';
+            var pass = '{$VDCM.PASS}';
+            var nodeKey = '{$VDCM.PROC.NODE}';
+            var excludeRaw = '{$VDCM.PROC.EXCLUDE}';
+            var excludeList = excludeRaw ? excludeRaw.split(',').map(function(s){ return s.trim().toLowerCase(); }).filter(Boolean) : [];
+            
+            if (!url || url.indexOf('http') !== 0) {
+                throw new Error('Invalid {$VDCM.URL}: "' + url + '". Set https://hostname[:port] in host macros.');
+            }
+            
+            // Step 1: Login — POST /login_handler?came_from=/ → HTTP 302 + Set-Cookie
+            var login = new HttpRequest();
+            try { login.setopt(64, 0); } catch(e) {}  // CURLOPT_SSL_VERIFYPEER
+            try { login.setopt(81, 0); } catch(e) {}  // CURLOPT_SSL_VERIFYHOST
+            try { login.setopt(52, 0); } catch(e) {}  // CURLOPT_FOLLOWLOCATION: don't follow 302
+            login.addHeader('Content-Type: application/x-www-form-urlencoded');
+            login.post(
+                url + '/login_handler?came_from=%2F',
+                'login=' + encodeURIComponent(user) +
+                '&password=' + encodeURIComponent(pass) +
+                '&login_button=Login'
+            );
+            var loginCode = login.getStatus();
+            
+            // Extract cookies — getHeaders(false) returns object in Zabbix 6.0+;
+            // fallback parses raw string for older versions or edge cases.
+            var cookies = [];
+            try {
+                var hdrs = login.getHeaders(false);
+                if (hdrs && typeof hdrs === 'object' && !Array.isArray(hdrs)) {
+                    Object.keys(hdrs).forEach(function(k) {
+                        if (k.toLowerCase() === 'set-cookie') {
+                            var v = hdrs[k];
+                            (Array.isArray(v) ? v : [v]).forEach(function(c) {
+                                var p = c.split(';')[0].trim();
+                                if (p) cookies.push(p);
+                            });
+                        }
+                    });
+                }
+            } catch(e) {}
+            if (cookies.length === 0) {
+                // Fallback: parse raw header string
+                try {
+                    var raw = login.getHeaders(true);
+                    if (typeof raw !== 'string') raw = String(raw);
+                    (raw.match(/Set-Cookie:\s*([^\r\n]+)/ig) || []).forEach(function(m) {
+                        var p = m.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim();
+                        if (p) cookies.push(p);
+                    });
+                } catch(e) {}
+            }
+            if (cookies.length === 0) {
+                throw new Error('Login failed (HTTP ' + loginCode + '). No cookies. URL=' + url + ' user=' + user + '. Set {$VDCM.URL}/{$VDCM.PASS} in host macros.');
+            }
+            
+            // Step 2: Query encoding services tree
+            var api = new HttpRequest();
+            try { api.setopt(64, 0); } catch(e) {}
+            try { api.setopt(81, 0); } catch(e) {}
+            api.addHeader('Content-Type: application/x-www-form-urlencoded');
+            api.addHeader('Cookie: ' + cookies.join('; '));
+            var result = api.post(
+                url + '/service/overview/opennode2',
+                'xID=' + encodeURIComponent(nodeKey) + '&type=S'
+            );
+            
+            if (!result) {
+                throw new Error('vDCM opennode2 empty response. Check {$VDCM.PROC.NODE}: "' + nodeKey + '".');
+            }
+            
+            var data = JSON.parse(result);
+            var services = [];
+            data.forEach(function(item) {
+                if (item.nodetype === 'S') {
+                    // tooltip format: "ServiceName\ncur: 9.8 Mbps\nmax: ..."
+                    var m = (item.tooltip || '').match(/cur:\s*([\d.]+)/);
+                    var bps = m ? Math.round(parseFloat(m[1]) * 1000000) : 0;
+                    // Extract short name (first word before space or parenthesis)
+                    var name = (item.title || '').split(/[\s(]/)[0];
+                    // Skip services matching {$VDCM.PROC.EXCLUDE} (e.g. RTMP push sources)
+                    var nameLow = name.toLowerCase();
+                    if (excludeList.some(function(ex) { return nameLow.indexOf(ex) >= 0; })) { return; }
+                    services.push({ name: name, bps: bps, title: item.title || name });
+                }
+            });
+            
+            if (services.length === 0) {
+                throw new Error('No S-type services found under node: "' + nodeKey +
+                    '". Try a different {$VDCM.PROC.NODE} value (e.g. T_T:2:*:*:*:*:e0).');
+            }
+            
+            return JSON.stringify(services);
+          description: 'Logs into vDCM web UI via POST /login_handler and queries all S-type encoding services under {$VDCM.PROC.NODE} via POST /service/overview/opennode2. Returns JSON array: [{"name":"SvcName","bps":200000,"title":"Full Title"},...]. NOTE: The "bps" value is vMFP internal keepalive (~0.2~0.4 Mbps), NOT real output bitrate. It drops to 0 only when the vMFP service crashes. Used as service health indicator. This is the master item for per-service heartbeat LLD discovery. If empty response: check {$VDCM.PROC.NODE} value. If login fails: check {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}.'
+          timeout: 30s
+          triggers:
+            - uuid: a9b8c7d6e5f4490382a9b8c7d6e5f640
+              expression: 'nodata(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.services.bitrates,5m)=1'
+              name: 'vDCM: no bitrate data for 5+ minutes (device unreachable or script failure)'
+              priority: HIGH
+              description: 'No bitrate data collected for 5+ minutes. Possible causes: 1. vDCM device unreachable (network / firewall issue). 2. Login failed - check {$VDCM.URL}, {$VDCM.USER}, {$VDCM.PASS}. 3. Wrong {$VDCM.PROC.NODE} - check Zabbix item log for script error. All per-service bitrate monitors are effectively blind until this clears.'
+      discovery_rules:
+        - uuid: d4e5f6a7b8c9490692d4e5f6a7b8c9da
+          name: 'vDCM input stream discovery'
+          type: DEPENDENT
+          key: vdcm.input.discovery
+          lifetime: 7d
+          description: 'Discovers all active input source streams from cards in {$VDCM.INPUT.CARDS}. Creates one bitrate item per unique stream (name + IP:port combination). Trigger prototypes: stream stopped (=0 bps) and low bitrate per stream. Override {$INPUT.BITRATE.WARN} and {$INPUT.BITRATE.MIN} per host. litv_tran2: T_I:1:4 = 14 UDP/SRT physical streams, T_I:1:65532 = 11 RTMP/local streams.'
+          item_prototypes:
+            - uuid: e5f6a7b8c9da490793e5f6a7b8c9daeb
+              name: '{#INNAME} ({#INSRC}) - input bitrate'
+              type: DEPENDENT
+              key: 'vdcm.input.bitrate[{#INKEY}]'
+              history: 90d
+              units: bps
+              description: 'Input source stream {#INNAME} from {#INSRC} current bitrate in bps (auto-scaled to Kbps/Mbps). Zero means the source signal is lost / encoder has no input. Sourced from /bitrates/input/get_rows (real-time, refreshed every 1 min).'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var key = '{#INKEY}';
+                      for (var i = 0; i < data.length; i++) {
+                          if (data[i].key === key) { return String(data[i].bps); }
+                      }
+                      return '0'; // input absent from response = treat as signal lost (bps=0)
+              master_item:
+                key: vdcm.input.bitrates
+              trigger_prototypes:
+                - uuid: f6a7b8c9daeb490894f6a7b8c9daebfc
+                  expression: 'max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.input.bitrate[{#INKEY}],#3)=0'
+                  name: '{#INNAME}: INPUT stream lost (bitrate = 0) [{#INSRC}]'
+                  priority: DISASTER
+                  description: 'Input stream {#INNAME} ({#INSRC}) dropped to zero for 3 consecutive polls (3 min). RTMP 1~2 min reconnect blips are suppressed (require 3 consecutive polls). 3 consecutive zero-bitrate readings reliably indicates a real stream loss. Check source encoder / upstream equipment at {#INSRC}.'
+            - uuid: d6e7f8a9b0c1490bb5d6e7f8a9b0c1d2
+              name: '[Guard] {#INNAME} ({#INSRC}) - output running?'
+              type: DEPENDENT
+              key: 'vdcm.output.for_input[{#INKEY}]'
+              history: 1d
+              value_type: FLOAT
+              trends: '0'
+              units: bps
+              description: |
+                INTERNAL GUARD — not a real bitrate metric. Used only in trigger expressions to suppress false "input low" alarms when the corresponding output channel is still running. Value semantics:
+                  -1 = no matching output found → guard disabled (alarm fires on threshold alone)
+                   0 = output stopped → alarm fires when input is also low
+                  >0 = output running → input low alarm suppressed (VBR/RTMP fluctuation)
+                Source: vdcm.input.bitrates out_kbps field (Port5 SRT match or ABR processing service).
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var key = '{#INKEY}';
+                      for (var i = 0; i < data.length; i++) {
+                          if (data[i].key === key) {
+                              var v = data[i].out_kbps;
+                              if (v === undefined || v < 0) return String(v !== undefined ? v : -1);
+                              return String(v * 1000);
+                          }
+                      }
+                      return '-1';
+              master_item:
+                key: vdcm.input.bitrates
+          trigger_prototypes:
+            - uuid: c9daebfc0d4e4a2ab8c9daebfc0d1e2f
+              expression: 'max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.input.bitrate[{#INKEY}],#3)<{$INPUT.BITRATE.MIN}*1000 and min(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.input.bitrate[{#INKEY}],#3)>0 and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.output.for_input[{#INKEY}])<=0'
+              name: '{#INNAME}: input bitrate critically low (below {$INPUT.BITRATE.MIN} Kbps) [{#INSRC}]'
+              priority: HIGH
+              description: |
+                Input stream {#INNAME} ({#INSRC}) bitrate critically below {$INPUT.BITRATE.MIN} Kbps for 3 consecutive polls (3 min), AND Port 5 output is stopped or has no match. Guard: last(vdcm.output.for_input[{#INKEY}]) <= 0
+                  out_kbps > 0 → Port 5 output running → input critically low is VBR/signal issue → suppressed
+                  out_kbps = 0 → Port 5 output stopped → real encoding fault → alert fires
+                  out_kbps = -1 → no matching Port 5 channel → guard disabled → fires on threshold
+                Urgent action required. Check source encoder at {#INSRC}. Current value: {ITEM.LASTVALUE}.
+            - uuid: a7b8c9daebfc490995a7b8c9daebfc0d
+              expression: 'max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.input.bitrate[{#INKEY}],#5)<{$INPUT.BITRATE.WARN}*1000 and max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.input.bitrate[{#INKEY}],#5)>={$INPUT.BITRATE.MIN}*1000 and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.output.for_input[{#INKEY}])<=0'
+              name: '{#INNAME}: input bitrate low (below {$INPUT.BITRATE.WARN} Kbps) [{#INSRC}]'
+              priority: WARNING
+              description: |
+                Input stream {#INNAME} ({#INSRC}) bitrate below {$INPUT.BITRATE.WARN} Kbps for 5 consecutive polls (5 min sustained), AND the corresponding Port 5 output channel ({$VDCM.OUTPUT.CARD}) is stopped or has no match (out_kbps <= 0). Guard: last(vdcm.output.for_input[{#INKEY}]) <= 0
+                  out_kbps > 0 → Port 5 output running → input low is VBR fluctuation → suppressed
+                  out_kbps = 0 → Port 5 output stopped → real encoding fault → alert fires
+                  out_kbps = -1 → no matching Port 5 channel → guard disabled → fires on threshold
+                Matching logic: exact name OR channel-name-prefix (before ' (') vs output table col[10]. Example: "DayStarMain" matches "DayStarMain (1920x1080p29.97 @ 5000 kbps) (MR)". Check upstream encoder at {#INSRC}. Current value: {ITEM.LASTVALUE}.
+          master_item:
+            key: vdcm.input.bitrates
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var data = JSON.parse(value);
+                  return JSON.stringify(data.map(function(s) {
+                      return {
+                          '{#INKEY}':  s.key,
+                          '{#INNAME}': s.name,
+                          '{#INIP}':   s.ip,
+                          '{#INPORT}': s.port,
+                          '{#INSRC}':  s.src
+                      };
+                  }));
+        - uuid: d5e6f7a8b9ca4d4ebcd5e6f7a8b9cadb
+          name: 'vDCM Port 5 SRT output stream discovery'
+          type: DEPENDENT
+          key: vdcm.port5.discovery
+          lifetime: 7d
+          description: |
+            Discovers all TS_S and TS_S_P (SRT) output streams on Port 5 ({$VDCM.OUTPUT.CARD}). Creates bitrate + connection-status items and trigger prototypes per discovered stream. All named streams included (包括 TS_S Program N 如 Tran2 的 Program 1 ~3.6 Mbps)。 Verified on litv_tran1 (TS_S): TVBSN SRT, EBCNews SRT, EBCF, FTV-HD SRT (~9.8 Mbps). Verified on litv_tran2: CTSMainSRT/TS_S (~7.8 Mbps), Program 1/TS_S (~3.6 Mbps);
+              TVBSN SRT/EBCNews SRT/EBCF SRT/FTV-HD SRT (TS_S_P passthrough, on=1 bps=0)。
+            Trigger 邏輯: stopped=bitrate=0且on=0; low=bitrate<WARN且on=1; TS_S_P不誤報。 Threshold macros: {$PORT5.BITRATE.WARN} (5 Mbps), {$PORT5.BITRATE.MIN} (2 Mbps).
+          item_prototypes:
+            - uuid: e6f7a8b9cadb4e5f8de6f7a8b9cadbec
+              name: '{#STREAM.NAME} - Port 5 SRT output bitrate'
+              type: DEPENDENT
+              key: 'vdcm.port5.stream.bitrate[{#STREAM.NAME}]'
+              history: 90d
+              units: bps
+              description: 'Current output bitrate for SRT stream {#STREAM.NAME} on Port 5 ({$VDCM.OUTPUT.CARD}) in Kbps. Sourced from /service/overview/opennode2 tooltip "cur: X.X" field (TS_S node type). Zero means the SRT output stream has stopped.'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var name = '{#STREAM.NAME}';
+                      for (var i = 0; i < data.length; i++) {
+                          if (data[i].name === name) { return String(data[i].bps); }
+                      }
+                      throw new Error(name + ' not found in vdcm.port5.bitrates response');
+              master_item:
+                key: vdcm.port5.bitrates
+              trigger_prototypes:
+                - uuid: b9cadbecfd0e4b81bfb9cadbecfd0e1f
+                  expression: 'max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.stream.bitrate[{#STREAM.NAME}],#3)<{$PORT5.BITRATE.MIN}*1000 and max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.stream.bitrate[{#STREAM.NAME}],#3)>0'
+                  name: '{#STREAM.NAME}: SRT output critically low (below {$PORT5.BITRATE.MIN} Kbps)'
+                  priority: DISASTER
+                  description: 'SRT output stream {#STREAM.NAME} bitrate critically below {$PORT5.BITRATE.MIN} Kbps. Stream is nearly stopped. Check vDCM Outputs > I/O 1 > Port 5 ({$VDCM.OUTPUT.CARD}).'
+            - uuid: 979f7f94b7fe4df983bb9c9ebf567b3a
+              name: '{#STREAM.NAME} - Port 5 SRT connection status'
+              type: DEPENDENT
+              key: 'vdcm.port5.stream.on[{#STREAM.NAME}]'
+              history: 90d
+              description: 'SRT stream connection state: 1=ON (connected/receiver present), 0=OFF (disconnected). Extracted from opennode2 title: " ON " present → 1, otherwise → 0. Applies to both TS_S (re-encode) and TS_S_P (passthrough) stream types.'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var name = '{#STREAM.NAME}';
+                      for (var i = 0; i < data.length; i++) {
+                          if (data[i].name === name) {
+                              return String(data[i].on !== undefined ? data[i].on : 1);
+                          }
+                      }
+                      throw new Error(name + ' not found in vdcm.port5.bitrates response');
+              master_item:
+                key: vdcm.port5.bitrates
+          trigger_prototypes:
+            - uuid: a8b9cadbecfd4a70afa8b9cadbecfd0e
+              expression: 'max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.stream.bitrate[{#STREAM.NAME}],#3)<{$PORT5.BITRATE.WARN}*1000 and max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.stream.bitrate[{#STREAM.NAME}],#3)>={$PORT5.BITRATE.MIN}*1000 and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.stream.on[{#STREAM.NAME}])=1'
+              name: '{#STREAM.NAME}: SRT output bitrate low (below {$PORT5.BITRATE.WARN} Kbps)'
+              priority: HIGH
+              description: 'SRT output stream {#STREAM.NAME} bitrate below {$PORT5.BITRATE.WARN} Kbps for 3 polls but still >= {$PORT5.BITRATE.MIN} Kbps (degraded but not critically low). TS_S_P passthrough 串流 (on=1, bps=0) 不觸發此 trigger（已加 on=1 條件）。 Override {$PORT5.BITRATE.WARN} per host to match expected bitrate.'
+            - uuid: f7a8b9cadbec4f6f8ef7a8b9cadbecfd
+              expression: 'max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.stream.bitrate[{#STREAM.NAME}],#3)=0 and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.port5.stream.on[{#STREAM.NAME}])=0'
+              name: '{#STREAM.NAME}: SRT output stopped (bitrate=0 且 連線斷開)'
+              priority: DISASTER
+              description: 'SRT output stream {#STREAM.NAME} bitrate=0 且連線狀態=OFF，持續 3 次 poll。 TS_S_P passthrough 串流 bitrate 恆為 0 但 on=1，不會觸發此 trigger。 Check vDCM Outputs > I/O 1 > Port 5 ({$VDCM.OUTPUT.CARD}).'
+          master_item:
+            key: vdcm.port5.bitrates
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var data = JSON.parse(value);
+                  return JSON.stringify(data.map(function(s) {
+                      return { '{#STREAM.NAME}': s.name, '{#STREAM.ON}': String(s.on !== undefined ? s.on : 1) };
+                  }));
+        - uuid: 428ce9fdd3914da8b3145f3997a538a1
+          name: 'vDCM encoding services discovery'
+          type: DEPENDENT
+          key: vdcm.services.discovery
+          lifetime: 7d
+          description: 'Discovers all S-type encoding services on this vDCM device by parsing vdcm.services.bitrates. Creates one heartbeat item per service. The heartbeat value (cur: ~0.2~0.4 Mbps) is a vMFP internal keepalive, NOT the real output bitrate. It drops to 0 only when the vMFP service itself crashes. The sole trigger is DISASTER (= 0) to catch service crash.'
+          item_prototypes:
+            - uuid: 8f323aeeb61949e59d2cb1a01ba8f5f4
+              name: '{#SVCNAME} - service heartbeat'
+              type: DEPENDENT
+              key: 'vdcm.bitrate[{#SVCNAME}]'
+              history: 90d
+              units: bps
+              description: '{#SVCTITLE} vMFP service internal heartbeat value in bps. Source: opennode2 tooltip "cur" field for processing node {$VDCM.PROC.NODE}. NOTE: This is NOT the real output bitrate. The ~0.2~0.4 Mbps value is vDCM internal IPC keepalive between vMFP transcoder modules. Zero means the vMFP service has crashed (not just low bitrate). For real output bitrate, see vdcm.port5.stream.bitrate[*] (SRT output). For real input bitrate, see vdcm.input.bitrate[*].'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var name = '{#SVCNAME}';
+                      for (var i = 0; i < data.length; i++) {
+                          if (data[i].name === name) { return String(data[i].bps); }
+                      }
+                      return '0'; // service absent from response = treat as crashed (bps=0)
+              master_item:
+                key: vdcm.services.bitrates
+              trigger_prototypes:
+                - uuid: d0e1f2a3b4c5490c89d0e1f2a3b4c596
+                  expression: >-
+                    max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.bitrate[{#SVCNAME}],#3)=0
+                    and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.output.stopped_count)>0
+                  recovery_mode: RECOVERY_EXPRESSION
+                  recovery_expression: >-
+                    max(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.bitrate[{#SVCNAME}],#3)>0
+                    and last(/Synamedia vDCM Encoder by HTTP API - YU-WEI IDC/vdcm.output.stopped_count)=0
+                  name: '{#SVCNAME}: vMFP service crashed (heartbeat = 0)'
+                  priority: DISASTER
+                  description: >-
+                    vMFP service {#SVCNAME} heartbeat has been zero for 3 consecutive polls (3 min)
+                    AND output stopped_count > 0 (confirmed: encoding has stopped).
+                    Recovery requires BOTH heartbeat > 0 AND stopped_count = 0 (all outputs running again).
+                    Check vDCM Status > Processing at {$VDCM.URL}.
+          master_item:
+            key: vdcm.services.bitrates
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var data = JSON.parse(value);
+                  return JSON.stringify(data.map(function(s) {
+                      return { '{#SVCNAME}': s.name, '{#SVCTITLE}': s.title };
+                  }));
+      macros:
+        - macro: '{$INPUT.BITRATE.MIN}'
+          value: '500'
+          description: 'Critical threshold for INPUT source stream bitrate in Kbps. Trigger fires when input bitrate drops below this value but is still > 0. Default 500 Kbps = severely degraded / signal nearly lost. Observed litv_tran1 stream minimums: high-bitrate ≥9767, mid ≥5515, low ≥504. Override per host for scheduled low-bitrate streams (e.g. DayStarMain: set 300).'
+        - macro: '{$INPUT.BITRATE.WARN}'
+          value: '2500'
+          description: |
+            Warning threshold for INPUT source stream bitrate in Kbps. Trigger fires when input bitrate drops below this value but is still > 0. Default 2500 Kbps (2.5 Mbps). Observed ranges on litv_tran1:
+              High-bitrate streams (EBC/FTV/TVBS/CTI): 9700-9900 Kbps → WARN irrelevant (only=0 matters)
+              Mid-bitrate streams (CTSNews/SET/iNews): 5500-7300 Kbps → WARN=2500 catches real drops
+              Low-bitrate streams (NownewsCht): avg 2795 Kbps → override per-host to 1500
+              Scheduled low-bitrate (DayStarMain): avg 2050 Kbps active hrs → override per-host to 1500
+            Override per host macro {$INPUT.BITRATE.WARN} to match expected stream bitrate.
+        - macro: '{$INPUT.NAME.MAP}'
+          value: '{}'
+          description: 'Manual fallback map for "Program NNN" streams whose SID is not unique in the service tree (e.g. SID=1 appears in many TS streams and is ambiguous). Auto-naming via the opennode2 service tree handles unique SIDs automatically. Key = "IP:Port:SID", value = channel name. Example: {"230.0.0.26:3539:1":"MyChannel","230.0.0.27:3539:1":"OtherChannel"} Set as per-host override. After saving, wait ~5 min for Zabbix LLD to apply.'
+        - macro: '{$INPUT.PROC.NAME.MAP}'
+          value: '{}'
+          description: |
+            Manual mapping of INPUT stream name → Processing service name, ONLY for streams where names have NO structural relationship and cannot be auto-matched. The script already auto-resolves via: exact match, SRT-strip, space normalization, and normalized prefix overlap (common prefix of lowercase+stripped names ≥ 60%). Auto-resolved examples (no entry needed):
+              "FTV" → "FTV-HD" or "FTV NEWS", "EBC" → "EBCNews*", "CTV News" → "CTVNewsQT"
+              "SET iNEWS" → "SETiNewsRTMP" (tran1 only), "EBCFNews QT" → "EBCFNews QT"
+              "CTS News Information Channe" → "CTSNewsQT" (handles vDCM API truncation)
+            Entries needed for truly unresolvable cases OR where auto-match gives wrong result:
+              litv_tran1: {"SET iNEWS":"SET-88"}
+                SET-88 = iNEWS channel (SET Television ch.88); auto-match incorrectly maps
+                "SET iNEWS" to "SETiNewsRTMP" via prefix overlap, manual override fixes this.
+                TVBS input (RTMP) has no matching processing service on tran1 → guard disabled,
+                but TVBS cur ~9.8 Mbps is far above any threshold so this is safe.
+              litv_tran2: {"SET iNEWS":"SETNewsRTMP"}
+                iNewsQT input on tran2 has no corresponding processing service (tran2 does not
+                process iNews); guard is disabled but cur ~6.8 Mbps is well above any threshold.
+            Key = exact input name (from bitrates/input table). Value = Processing service name (full name before first ‘(‘ in title, as shown in service overview). Set as per-host macro override. Template default {} is safe (auto-match handles most).
+        - macro: '{$PORT5.BITRATE.MIN}'
+          value: '2000'
+          description: 'Critical threshold (Kbps) for Port 5 SRT output streams. Fires when stream bitrate drops below this value but is still > 0. Default 2000 Kbps (2 Mbps). Override per host if needed.'
+        - macro: '{$PORT5.BITRATE.WARN}'
+          value: '5000'
+          description: 'Warning threshold (Kbps) for Port 5 SRT output streams. Fires when stream bitrate drops below this value but is still > 0. Default 5000 Kbps (5 Mbps). litv_tran1 SRT streams ~9800 Kbps; litv_tran2 CTSMainSRT ~6400 Kbps. Override per host: e.g. 7000 for high-bitrate SRT.'
+        - macro: '{$VDCM.INPUT.CARDS}'
+          value: 'T_I:1:4,T_I:1:65532'
+          description: 'Comma-separated list of input card xIDs for /bitrates/input monitoring. T_I:1:4 = physical NIC inputs (Port 5 Input/Mgmt, UDP/SRT streams). T_I:1:65532 = local/RTMP/SRT software inputs. Override per host if your device has different card IDs. Find card IDs: open /bitrates/input in browser DevTools, check s_xID parameter in XHR request to /bitrates/input/get_rows.'
+        - macro: '{$VDCM.OUTPUT.CARD}'
+          value: 'T_O:1:4'
+          description: 'Output card xID for Port 5 (Outputs > I/O 1 > Port 5). Used for (1) INPUT alarm guard condition and (2) direct Port 5 SRT stream monitoring. Default T_O:1:4. Verified for litv_tran1/tran2. Override per host if different.'
+        - macro: '{$VDCM.PASS}'
+          type: SECRET_TEXT
+          description: 'vDCM web login password. Set per-host override as Secret macro.'
+        - macro: '{$VDCM.PROC.CARDS}'
+          value: 'T_I:2:0'
+          description: 'Comma-separated list of vMFP card xIDs for /status/processing monitoring. T_I:2:0 = vMFP board (encoding/transcoding processing alarms). On Tran1/Tran2: processing alarms are on vMFP (T_I:2:0), NOT the network input cards. On FTV/SPORTCAST: processing cards are the same as input cards (T_I:2:0~3 SDI). Note: this macro is separate from {$VDCM.INPUT.CARDS} to allow independent override.'
+        - macro: '{$VDCM.PROC.EXCLUDE}'
+          description: 'Comma-separated substrings; services whose name contains any of these are skipped. Default: empty (monitor all services). Set to ''RTMP'' per host if needed.'
+        - macro: '{$VDCM.PROC.NODE}'
+          value: 'T_T:2:*:*:e0'
+          description: 'Processing node key for /service/overview/opennode2. T_T:2:*:*:e0 works for litv_tran1 (211.21.3.208), litv_tran2 (211.21.3.210) and most single-node vDCM deployments. Find from browser DevTools Network tab: look for opennode2 POST xID parameter.'
+        - macro: '{$VDCM.URL}'
+          description: 'vDCM base URL, no trailing slash. E.g. https://211.21.3.208:4431 or https://60.251.153.74'
+        - macro: '{$VDCM.USER}'
+          value: Administrator
+          description: 'vDCM web login username'
+        - macro: '{$VIDEO.BITRATE.MIN}'
+          value: '50'
+          description: 'Critical threshold in Kbps. Trigger fires when service bitrate drops below this value but is still > 0. Default 50 (0.05 Mbps) suits ABR/OTT transcoding services. Override per host for broadcast: e.g. 2000 for 8 Mbps services.'
+        - macro: '{$VIDEO.BITRATE.WARN}'
+          value: '150'
+          description: 'Warning threshold in Kbps. Trigger fires when service bitrate drops below this value but is still > 0. Default 150 (0.15 Mbps) suits ABR/OTT transcoding services (litv_tran1/tran2 normal range: 200-400 Kbps). Override per host for broadcast: e.g. 5000 for 8 Mbps services.'
+      dashboards:
+        - uuid: 1a2b3c4d5e6f4a01a8b7c6d5e4f3a2b1
+          name: 'vDCM Monitoring'
+          pages:
+            - widgets:
+                - type: item
+                  name: 'vDCM State'
+                  width: '6'
+                  height: '3'
+                  fields:
+                    - type: ITEM
+                      name: itemid.0
+                      value:
+                        host: 'Synamedia vDCM Encoder by HTTP API - YU-WEI IDC'
+                        key: vdcm.device.vdcm_state
+                - type: item
+                  name: 'Device Alarms Detail'
+                  'y': '3'
+                  width: '12'
+                  height: '4'
+                  fields:
+                    - type: ITEM
+                      name: itemid.0
+                      value:
+                        host: 'Synamedia vDCM Encoder by HTTP API - YU-WEI IDC'
+                        key: vdcm.alarms.detail
+                - type: problems
+                  name: 'Active Problems'
+                  'y': '7'
+                  width: '24'
+                  height: '5'
+                  fields:
+                    - type: INTEGER
+                      name: show
+                      value: '3'
+                    - type: INTEGER
+                      name: show_suppressed
+                      value: '0'
+                - type: svggraph
+                  name: 'OUTPUT Encoding Bitrates (all services)'
+                  'y': '12'
+                  width: '24'
+                  height: '10'
+                  fields:
+                    - type: INTEGER
+                      name: ds.0.aggregate_function
+                      value: '0'
+                    - type: STRING
+                      name: ds.0.color
+                      value: FF9800
+                    - type: STRING
+                      name: ds.0.hosts.0
+                      value: 'Synamedia vDCM Encoder by HTTP API - YU-WEI IDC'
+                    - type: STRING
+                      name: ds.0.items.0
+                      value: 'vdcm.bitrate[*]'
+                    - type: INTEGER
+                      name: ds.0.transparency
+                      value: '5'
+                    - type: INTEGER
+                      name: ds.0.type
+                      value: '0'
+                    - type: INTEGER
+                      name: legend
+                      value: '1'
+                - type: svggraph
+                  name: 'INPUT Stream Bitrates (all sources)'
+                  'y': '22'
+                  width: '24'
+                  height: '10'
+                  fields:
+                    - type: INTEGER
+                      name: ds.0.aggregate_function
+                      value: '0'
+                    - type: STRING
+                      name: ds.0.color
+                      value: 4CAF50
+                    - type: STRING
+                      name: ds.0.hosts.0
+                      value: 'Synamedia vDCM Encoder by HTTP API - YU-WEI IDC'
+                    - type: STRING
+                      name: ds.0.items.0
+                      value: 'vdcm.input.bitrate[*]'
+                    - type: INTEGER
+                      name: ds.0.transparency
+                      value: '5'
+                    - type: INTEGER
+                      name: ds.0.type
+                      value: '0'
+                    - type: INTEGER
+                      name: legend
+                      value: '1'
+                - type: svggraph
+                  name: 'Port 5 SRT Output Bitrates (TVBSN/EBCNews/EBCF/FTV-HD)'
+                  'y': '32'
+                  width: '24'
+                  height: '10'
+                  fields:
+                    - type: INTEGER
+                      name: ds.0.aggregate_function
+                      value: '0'
+                    - type: STRING
+                      name: ds.0.color
+                      value: 2196F3
+                    - type: STRING
+                      name: ds.0.hosts.0
+                      value: 'Synamedia vDCM Encoder by HTTP API - YU-WEI IDC'
+                    - type: STRING
+                      name: ds.0.items.0
+                      value: 'vdcm.port5.stream.bitrate[*]'
+                    - type: INTEGER
+                      name: ds.0.transparency
+                      value: '5'
+                    - type: INTEGER
+                      name: ds.0.type
+                      value: '0'
+                    - type: INTEGER
+                      name: legend
+                      value: '1'
+                - type: item
+                  name: 'Device State'
+                  x: '6'
+                  width: '6'
+                  height: '3'
+                  fields:
+                    - type: ITEM
+                      name: itemid.0
+                      value:
+                        host: 'Synamedia vDCM Encoder by HTTP API - YU-WEI IDC'
+                        key: vdcm.device.state
+                - type: item
+                  name: 'Active Alarm Count'
+                  x: '12'
+                  width: '6'
+                  height: '3'
+                  fields:
+                    - type: ITEM
+                      name: itemid.0
+                      value:
+                        host: 'Synamedia vDCM Encoder by HTTP API - YU-WEI IDC'
+                        key: vdcm.device.alarms
+                - type: item
+                  name: 'Processing Alarms'
+                  x: '12'
+                  'y': '3'
+                  width: '12'
+                  height: '4'
+                  fields:
+                    - type: ITEM
+                      name: itemid.0
+                      value:
+                        host: 'Synamedia vDCM Encoder by HTTP API - YU-WEI IDC'
+                        key: vdcm.processing.alarms
+                - type: item
+                  name: 'Stopped Output Services'
+                  x: '18'
+                  width: '6'
+                  height: '3'
+                  fields:
+                    - type: ITEM
+                      name: itemid.0
+                      value:
+                        host: 'Synamedia vDCM Encoder by HTTP API - YU-WEI IDC'
+                        key: vdcm.output.stopped_count
