@@ -98,10 +98,16 @@ zabbix_export:
             }
             var sessid=loginResp.sessid;
 
+            // VideoSource numeric code -> human-readable input type (from the device's own
+            // Source_setting.js UI logic). No "channel name" field exists on this unit (Name/Group
+            // are both blank on every channel - confirmed live) so this is the best identifying
+            // label auto-scannable per channel.
+            var SRC_TYPES={0:'Composite',1:'S-Video',2:'HDMI',3:'DVI',4:'YPbPr',5:'VGA',6:'SDI',7:'Image',8:'IP Stream',9:'Playback',10:'NDI',11:'UVC',12:'DP',13:'HLS'};
+
             var result={channels:[]};
             channels.forEach(function(ch){
               var devPath='/_dev'+ch;
-              var chData={ch:ch, signal:-1, width:0, height:0, framerate:0, streams:[]};
+              var chData={ch:ch, signal:-1, width:0, height:0, framerate:0, type:'unknown', name:'', streams:[]};
               try{
                 var inFmt=post(devPath, {qcapid:qcapid, sessid:sessid, Function:'APPS_GET_INPUT_FORMAT'});
                 if(inFmt && inFmt.Return===0){
@@ -109,6 +115,13 @@ zabbix_export:
                   chData.width=inFmt.Width;
                   chData.height=inFmt.Height;
                   chData.framerate=inFmt.Framerate;
+                }
+              }catch(e){}
+              try{
+                var vsrc=post(devPath, {qcapid:qcapid, sessid:sessid, Function:'APPS_GET_VIDEO_SOURCE'});
+                if(vsrc && vsrc.Return===0){
+                  chData.type=SRC_TYPES[vsrc.VideoSource]||('type'+vsrc.VideoSource);
+                  chData.name=String(vsrc.Name||'').trim();
                 }
               }catch(e){}
               [1,2].forEach(function(streamNum){
@@ -137,7 +150,7 @@ zabbix_export:
           description: 'Discovers one {#CH} per entry in qcap.data''s channels array (one per {$QCAP.CHANNELS} dev index).'
           item_prototypes:
             - uuid: a17a3f7905a846b5a03cf2925828bd7f
-              name: 'QCAP {#CH}: input signal'
+              name: 'QCAP {#CH} ({#TYPE}): input signal'
               type: DEPENDENT
               key: 'qcap.signal[{#CH}]'
               value_type: UNSIGNED
@@ -155,11 +168,11 @@ zabbix_export:
               trigger_prototypes:
                 - uuid: acbdb7a71327464abf068e18958f2e4f
                   expression: 'max(/QCAP SC6D0 Encoder by HTTP API/qcap.signal[{#CH}],{$QCAP.SIGNAL.MISSING.TIME})=0'
-                  name: 'QCAP {#CH}: No input signal for {$QCAP.SIGNAL.MISSING.TIME}'
+                  name: 'QCAP {#CH} ({#TYPE}): No input signal for {$QCAP.SIGNAL.MISSING.TIME}'
                   priority: WARNING
                   description: 'Signal has been 0 for the entire {$QCAP.SIGNAL.MISSING.TIME} window (max()=0 means no 1 occurred in that period). Per-channel override via {$QCAP.SIGNAL.MISSING.TIME:<CH>} for channels that are intentionally idle/unused (e.g. set to 24h to effectively disable).'
             - uuid: 77f703debdf240c39f62454aea7123ee
-              name: 'QCAP {#CH}: main stream status'
+              name: 'QCAP {#CH} ({#TYPE}): main stream status'
               type: DEPENDENT
               key: 'qcap.stream.status[{#CH}]'
               value_type: UNSIGNED
@@ -179,11 +192,11 @@ zabbix_export:
               trigger_prototypes:
                 - uuid: 95b15f5994f94b24855e55223a77ff26
                   expression: 'last(/QCAP SC6D0 Encoder by HTTP API/qcap.signal[{#CH}])=1 and last(/QCAP SC6D0 Encoder by HTTP API/qcap.stream.status[{#CH}])=0'
-                  name: 'QCAP {#CH}: streaming stopped despite valid input signal'
+                  name: 'QCAP {#CH} ({#TYPE}): streaming stopped despite valid input signal'
                   priority: AVERAGE
                   description: 'Input signal is present but the main stream (StreamNum=1) is not active - likely an encoder/network/streaming-target problem rather than a source signal problem. Check vDCM {$QCAP.URL} web UI > Status.'
             - uuid: d99b94b8362a49b084068b507e806b6f
-              name: 'QCAP {#CH}: main stream connections'
+              name: 'QCAP {#CH} ({#TYPE}): main stream connections'
               type: DEPENDENT
               key: 'qcap.stream.connections[{#CH}]'
               value_type: UNSIGNED
@@ -201,7 +214,7 @@ zabbix_export:
               master_item:
                 key: qcap.data
             - uuid: 2efe224dbd544c8c8f463d779b8980ec
-              name: 'QCAP {#CH}: input resolution'
+              name: 'QCAP {#CH} ({#TYPE}): input resolution'
               type: DEPENDENT
               key: 'qcap.resolution[{#CH}]'
               value_type: TEXT
@@ -222,7 +235,7 @@ zabbix_export:
               parameters:
                 - |
                   var d=JSON.parse(value);
-                  return JSON.stringify((d.channels||[]).map(function(c){return {'{#CH}': c.ch};}));
+                  return JSON.stringify((d.channels||[]).map(function(c){return {'{#CH}': c.ch, '{#TYPE}': c.type||'unknown'};}));
           master_item:
             key: qcap.data
       macros:
